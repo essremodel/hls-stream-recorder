@@ -107,7 +107,7 @@ Built-in channels are sourced from publicly available free streams. Many origina
 ./record.sh --test-streams
 ./record.sh https://your-stream.com/index.m3u8
 ./record.sh --url https://your-stream.com/index.m3u8 --output /tmp/hls-capture
-echo 2 | ./record.sh --quiet --stream cbs4
+./record.sh --quiet --stream cbs4 --mode 1
 ./record.sh --stream abc --monitor --keywords ./keywords.txt --until 23:00
 ```
 
