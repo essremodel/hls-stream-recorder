@@ -14,6 +14,8 @@ HTTP_USER_AGENT="${HLS_RECORDER_USER_AGENT:-Mozilla/5.0 (HLS Stream Recorder)}"
 MASTER_URL=""
 OUT_DIR=""
 OUTPUT_OVERRIDE=""
+DEFAULT_OUTPUT_DIR="${SCRIPT_DIR}/recording_$(date +%Y%m%d)"
+DEFAULT_MONITOR_OUTPUT_DIR="${SCRIPT_DIR}/recording_monitor_$(date +%Y%m%d)"
 QUIET=0
 
 SEGMENT_SEC=300  # 5 minutes
@@ -21,10 +23,46 @@ TEST_SEC=15
 MAX_DURATION_MIN=1440
 SEGMENT_TIMEOUT_MULTIPLIER=2
 SLOW_SEGMENT_GRACE_SEC=15
+MONITOR_SEGMENT_SEC=150
+MONITOR_BUFFER_MINUTES=5
+MONITOR_BUFFER_SEC=$((MONITOR_BUFFER_MINUTES * 60))
+MONITOR_FLAG=0
+MONITOR_KEYWORDS_FILE="${SCRIPT_DIR}/keywords.txt"
+MONITOR_UNTIL_RAW=""
+MONITOR_UNTIL_SEC=""
+MONITOR_CC_METHOD="${HLS_MONITOR_CC_METHOD:-auto}"
+MONITOR_ACTIVE=0
+MONITOR_INTERRUPTED=0
+MONITOR_SUMMARY_PRINTED=0
+MONITOR_STATUS_LINES=0
+MONITOR_MATCHES_FOUND=0
+MONITOR_BUFFER_DIR=""
+MONITOR_KEPT_DIR=""
+MONITOR_LOG_FILE=""
+MONITOR_LAST_CC_PREVIEW=""
+MONITOR_LAST_MATCH_SUMMARY=""
+MONITOR_EMPTY_CC_STREAK=0
+MONITOR_LAST_SEGMENT_RECORDED=0
+MONITOR_BEST_URL=""
+MONITOR_STREAM_SUMMARY=""
+MONITOR_HAS_CC_DECLARED=0
+MONITOR_HAS_SUBTITLE_DECLARED=0
 
 declare -a TEMP_FILES=()
 declare -a ACTIVE_PIDS=()
 CLEANUP_DONE=0
+declare -A MONITOR_FLAGGED_SEGMENTS=()
+declare -A MONITOR_SEG_MP4=()
+declare -A MONITOR_SEG_SRT=()
+declare -A MONITOR_SEG_TXT=()
+declare -A MONITOR_MATCH_START=()
+declare -A MONITOR_MATCH_END=()
+declare -A MONITOR_MATCH_KEYWORDS=()
+declare -A MONITOR_MATCH_FIRST_TS=()
+declare -A MONITOR_MATCH_HITS=()
+declare -A MONITOR_MATCH_DIR=()
+declare -A MONITOR_MATCH_FINALIZED=()
+NEXT_MONITOR_MATCH_ID=1
 
 # ── Scheduled recording windows (24h format) ──
 # Window 1: 5:55 PM → 7:00 PM  (5 min early cushion)
@@ -59,9 +97,40 @@ for u in ['B','KB','MB','GB']:
 "
 }
 
+timestamp_now() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
 file_size_bytes() {
     [ -f "$1" ] || return 1
     wc -c < "$1" | tr -d ' '
+}
+
+count_nonempty_lines() {
+    [ -f "$1" ] || {
+        printf '0\n'
+        return 0
+    }
+    grep -c '[^[:space:]]' "$1" 2>/dev/null || printf '0\n'
+}
+
+sum_dir_bytes() {
+    local dir="$1"
+    local total=0
+    local file
+    [ -d "$dir" ] || {
+        printf '0\n'
+        return 0
+    }
+    while IFS= read -r -d '' file; do
+        size=$(file_size_bytes "$file" 2>/dev/null || printf '0')
+        total=$((total + size))
+    done < <(find "$dir" -type f -print0 2>/dev/null)
+    printf '%s\n' "$total"
+}
+
+disk_free_kb() {
+    df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'
 }
 
 now_seconds_of_day() {
@@ -97,6 +166,20 @@ open_output_dir() {
             fi
             ;;
     esac
+}
+
+set_default_windows() {
+    WIN_STARTS=()
+    WIN_ENDS=()
+    WIN_LABELS=()
+
+    WIN_STARTS+=("$((WIN1_START_HOUR*3600 + WIN1_START_MIN*60))")
+    WIN_ENDS+=("$((WIN1_END_HOUR*3600 + WIN1_END_MIN*60))")
+    WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN1_START_HOUR" "$WIN1_START_MIN" "$WIN1_END_HOUR" "$WIN1_END_MIN")")
+
+    WIN_STARTS+=("$((WIN2_START_HOUR*3600 + WIN2_START_MIN*60))")
+    WIN_ENDS+=("$((WIN2_END_HOUR*3600 + WIN2_END_MIN*60))")
+    WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN2_START_HOUR" "$WIN2_START_MIN" "$WIN2_END_HOUR" "$WIN2_END_MIN")")
 }
 
 start_timeout_watchdog() {
@@ -170,16 +253,18 @@ cleanup() {
         wait "$pid" 2>/dev/null || true
     done
 
+    monitor_cleanup_on_exit "$exit_code" || true
+
     for path in "${TEMP_FILES[@]}"; do
-        rm -f "$path"
+        rm -rf "$path"
     done
 
     return "$exit_code"
 }
 
 trap 'cleanup $?' EXIT
-trap 'cleanup 130; exit 130' INT
-trap 'cleanup 143; exit 143' TERM
+trap 'MONITOR_INTERRUPTED=1; cleanup 130; exit 130' INT
+trap 'MONITOR_INTERRUPTED=1; cleanup 143; exit 143' TERM
 
 parse_time() {
     local raw="$1"
@@ -238,6 +323,835 @@ Examples:
 EOF
 }
 
+format_seg_num() {
+    printf '%06d' "$1"
+}
+
+format_elapsed_compact() {
+    local seconds="$1"
+    local hours=$((seconds / 3600))
+    local minutes=$(((seconds % 3600) / 60))
+    if [ "$hours" -gt 0 ]; then
+        printf '%dh %02dm' "$hours" "$minutes"
+    else
+        printf '%dm %02ds' "$minutes" "$((seconds % 60))"
+    fi
+}
+
+monitor_log() {
+    [ -n "$MONITOR_LOG_FILE" ] || return 0
+    printf '[%s] %s\n' "$(timestamp_now)" "$1" >> "$MONITOR_LOG_FILE"
+}
+
+monitor_append_unique_line() {
+    local current="$1"
+    local value="$2"
+    local line
+    while IFS= read -r line; do
+        [ "$line" = "$value" ] && {
+            printf '%s' "$current"
+            return 0
+        }
+    done <<EOF
+$current
+EOF
+    if [ -n "$current" ]; then
+        printf '%s\n%s' "$current" "$value"
+    else
+        printf '%s' "$value"
+    fi
+}
+
+monitor_keywords_display() {
+    local raw="$1"
+    python3 - <<'PY' "$raw"
+import sys
+lines = [line.strip() for line in sys.argv[1].splitlines() if line.strip()]
+print(", ".join(lines))
+PY
+}
+
+monitor_pending_dir() {
+    printf '%s/match_%03d_pending' "$MONITOR_KEPT_DIR" "$1"
+}
+
+monitor_final_dir() {
+    local match_id="$1"
+    printf '%s/match_%03d_seg_%s-%s' \
+        "$MONITOR_KEPT_DIR" \
+        "$match_id" \
+        "$(format_seg_num "${MONITOR_MATCH_START[$match_id]}")" \
+        "$(format_seg_num "${MONITOR_MATCH_END[$match_id]}")"
+}
+
+monitor_write_match_info() {
+    local match_id="$1"
+    local target_dir="$2"
+    mkdir -p "$target_dir"
+    {
+        echo "Experimental keyword monitor match"
+        echo "Match ID: ${match_id}"
+        echo "Segment range: $(format_seg_num "${MONITOR_MATCH_START[$match_id]}")-$(format_seg_num "${MONITOR_MATCH_END[$match_id]}")"
+        echo "Detected: ${MONITOR_MATCH_FIRST_TS[$match_id]}"
+        echo "Keywords:"
+        printf '%s\n' "${MONITOR_MATCH_KEYWORDS[$match_id]}"
+        echo ""
+        echo "Hit details:"
+        printf '%s\n' "${MONITOR_MATCH_HITS[$match_id]}"
+    } > "${target_dir}/match_info.txt"
+}
+
+monitor_merge_matches() {
+    local primary="$1"
+    local secondary="$2"
+    local seg_id
+    local secondary_dir
+    local primary_dir
+
+    [ "$primary" = "$secondary" ] && return 0
+    [ -n "${MONITOR_MATCH_START[$secondary]:-}" ] || return 0
+
+    if [ "${MONITOR_MATCH_START[$secondary]}" -lt "${MONITOR_MATCH_START[$primary]}" ]; then
+        MONITOR_MATCH_START[$primary]="${MONITOR_MATCH_START[$secondary]}"
+    fi
+    if [ "${MONITOR_MATCH_END[$secondary]}" -gt "${MONITOR_MATCH_END[$primary]}" ]; then
+        MONITOR_MATCH_END[$primary]="${MONITOR_MATCH_END[$secondary]}"
+    fi
+    while IFS= read -r keyword; do
+        [ -n "$keyword" ] || continue
+        MONITOR_MATCH_KEYWORDS[$primary]="$(monitor_append_unique_line "${MONITOR_MATCH_KEYWORDS[$primary]:-}" "$keyword")"
+    done <<EOF
+${MONITOR_MATCH_KEYWORDS[$secondary]:-}
+EOF
+    if [ -n "${MONITOR_MATCH_HITS[$secondary]:-}" ]; then
+        if [ -n "${MONITOR_MATCH_HITS[$primary]:-}" ]; then
+            MONITOR_MATCH_HITS[$primary]="${MONITOR_MATCH_HITS[$primary]}
+${MONITOR_MATCH_HITS[$secondary]}"
+        else
+            MONITOR_MATCH_HITS[$primary]="${MONITOR_MATCH_HITS[$secondary]}"
+        fi
+    fi
+
+    secondary_dir="${MONITOR_MATCH_DIR[$secondary]:-$(monitor_pending_dir "$secondary")}"
+    primary_dir="${MONITOR_MATCH_DIR[$primary]:-$(monitor_pending_dir "$primary")}"
+    if [ -d "$secondary_dir" ]; then
+        mkdir -p "$primary_dir"
+        while IFS= read -r -d '' item; do
+            mv "$item" "$primary_dir"/
+        done < <(find "$secondary_dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+        rmdir "$secondary_dir" 2>/dev/null || true
+        MONITOR_MATCH_DIR[$primary]="$primary_dir"
+    fi
+
+    for seg_id in "${!MONITOR_FLAGGED_SEGMENTS[@]}"; do
+        [ "${MONITOR_FLAGGED_SEGMENTS[$seg_id]}" = "$secondary" ] && MONITOR_FLAGGED_SEGMENTS[$seg_id]="$primary"
+    done
+
+    unset MONITOR_MATCH_START["$secondary"]
+    unset MONITOR_MATCH_END["$secondary"]
+    unset MONITOR_MATCH_KEYWORDS["$secondary"]
+    unset MONITOR_MATCH_FIRST_TS["$secondary"]
+    unset MONITOR_MATCH_HITS["$secondary"]
+    unset MONITOR_MATCH_DIR["$secondary"]
+    unset MONITOR_MATCH_FINALIZED["$secondary"]
+}
+
+monitor_register_match() {
+    local segment_number="$1"
+    local keyword="$2"
+    local matched_line="$3"
+    local buffer_depth="$4"
+    local range_start="$((segment_number - buffer_depth))"
+    local range_end="$((segment_number + buffer_depth))"
+    local match_id=0
+    local existing_id
+    local extra_ids=()
+    local seg
+
+    [ "$range_start" -lt 1 ] && range_start=1
+
+    for (( existing_id=1; existing_id<NEXT_MONITOR_MATCH_ID; existing_id++ )); do
+        [ -n "${MONITOR_MATCH_START[$existing_id]:-}" ] || continue
+        if [ "$range_start" -le $((MONITOR_MATCH_END[$existing_id] + 1)) ] && [ "$range_end" -ge $((MONITOR_MATCH_START[$existing_id] - 1)) ]; then
+            if [ "$match_id" -eq 0 ]; then
+                match_id="$existing_id"
+            else
+                extra_ids+=("$existing_id")
+            fi
+        fi
+    done
+
+    if [ "$match_id" -eq 0 ]; then
+        match_id="$NEXT_MONITOR_MATCH_ID"
+        NEXT_MONITOR_MATCH_ID=$((NEXT_MONITOR_MATCH_ID + 1))
+        MONITOR_MATCHES_FOUND=$((MONITOR_MATCHES_FOUND + 1))
+        MONITOR_MATCH_START[$match_id]="$range_start"
+        MONITOR_MATCH_END[$match_id]="$range_end"
+        MONITOR_MATCH_FIRST_TS[$match_id]="$(timestamp_now)"
+        MONITOR_MATCH_KEYWORDS[$match_id]="$keyword"
+        MONITOR_MATCH_HITS[$match_id]="[$(timestamp_now)] ${keyword} :: ${matched_line}"
+        MONITOR_MATCH_FINALIZED[$match_id]=0
+    else
+        if [ "$range_start" -lt "${MONITOR_MATCH_START[$match_id]}" ]; then
+            MONITOR_MATCH_START[$match_id]="$range_start"
+        fi
+        if [ "$range_end" -gt "${MONITOR_MATCH_END[$match_id]}" ]; then
+            MONITOR_MATCH_END[$match_id]="$range_end"
+        fi
+        MONITOR_MATCH_KEYWORDS[$match_id]="$(monitor_append_unique_line "${MONITOR_MATCH_KEYWORDS[$match_id]:-}" "$keyword")"
+        if [ -n "${MONITOR_MATCH_HITS[$match_id]:-}" ]; then
+            MONITOR_MATCH_HITS[$match_id]="${MONITOR_MATCH_HITS[$match_id]}
+[$(timestamp_now)] ${keyword} :: ${matched_line}"
+        else
+            MONITOR_MATCH_HITS[$match_id]="[$(timestamp_now)] ${keyword} :: ${matched_line}"
+        fi
+    fi
+
+    for existing_id in "${extra_ids[@]}"; do
+        monitor_merge_matches "$match_id" "$existing_id"
+    done
+
+    for (( seg=range_start; seg<=range_end; seg++ )); do
+        MONITOR_FLAGGED_SEGMENTS[$seg]="$match_id"
+    done
+
+    printf '%s\n' "$match_id"
+}
+
+monitor_cleanup_buffer_segment() {
+    local seg="$1"
+    local reason="${2:-buffer expired}"
+    rm -f "${MONITOR_SEG_MP4[$seg]:-}" "${MONITOR_SEG_SRT[$seg]:-}" "${MONITOR_SEG_TXT[$seg]:-}"
+    unset MONITOR_SEG_MP4["$seg"]
+    unset MONITOR_SEG_SRT["$seg"]
+    unset MONITOR_SEG_TXT["$seg"]
+    monitor_log "SEG $(format_seg_num "$seg") DELETED (${reason})"
+}
+
+monitor_promote_segment() {
+    local seg="$1"
+    local match_id="${MONITOR_FLAGGED_SEGMENTS[$seg]:-}"
+    local pending_dir
+
+    [ -n "$match_id" ] || return 0
+    pending_dir="${MONITOR_MATCH_DIR[$match_id]:-$(monitor_pending_dir "$match_id")}"
+    mkdir -p "$pending_dir"
+    MONITOR_MATCH_DIR[$match_id]="$pending_dir"
+
+    [ -f "${MONITOR_SEG_MP4[$seg]:-}" ] && mv "${MONITOR_SEG_MP4[$seg]}" "$pending_dir"/
+    [ -f "${MONITOR_SEG_SRT[$seg]:-}" ] && mv "${MONITOR_SEG_SRT[$seg]}" "$pending_dir"/
+    [ -f "${MONITOR_SEG_TXT[$seg]:-}" ] && mv "${MONITOR_SEG_TXT[$seg]}" "$pending_dir"/
+    unset MONITOR_SEG_MP4["$seg"]
+    unset MONITOR_SEG_SRT["$seg"]
+    unset MONITOR_SEG_TXT["$seg"]
+}
+
+monitor_finalize_match_dir() {
+    local match_id="$1"
+    local pending_dir="${MONITOR_MATCH_DIR[$match_id]:-$(monitor_pending_dir "$match_id")}"
+    local final_dir
+
+    [ -n "${MONITOR_MATCH_START[$match_id]:-}" ] || return 0
+    final_dir="$(monitor_final_dir "$match_id")"
+    mkdir -p "$final_dir"
+    if [ -d "$pending_dir" ]; then
+        while IFS= read -r -d '' item; do
+            mv "$item" "$final_dir"/
+        done < <(find "$pending_dir" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+        if [ "$pending_dir" != "$final_dir" ]; then
+            rmdir "$pending_dir" 2>/dev/null || true
+        fi
+    fi
+    monitor_write_match_info "$match_id" "$final_dir"
+    MONITOR_MATCH_DIR[$match_id]="$final_dir"
+    MONITOR_MATCH_FINALIZED[$match_id]=1
+    MONITOR_LAST_MATCH_SUMMARY="#${match_id}  seg $(format_seg_num "${MONITOR_MATCH_START[$match_id]}")-$(format_seg_num "${MONITOR_MATCH_END[$match_id]}")"
+    monitor_log "MATCH ${match_id} FINALIZED → $(basename "$final_dir")"
+}
+
+monitor_finalize_ready_matches() {
+    local current_seg="$1"
+    local force="${2:-0}"
+    local match_id
+
+    for (( match_id=1; match_id<NEXT_MONITOR_MATCH_ID; match_id++ )); do
+        [ -n "${MONITOR_MATCH_START[$match_id]:-}" ] || continue
+        [ "${MONITOR_MATCH_FINALIZED[$match_id]:-0}" -eq 1 ] && continue
+        if [ "$force" -eq 1 ] || [ "$current_seg" -gt $((MONITOR_MATCH_END[$match_id] + MONITOR_BUFFER_DEPTH)) ]; then
+            monitor_finalize_match_dir "$match_id"
+        fi
+    done
+}
+
+monitor_finalize_flagged_segments() {
+    local seg
+    for (( seg=1; seg<=MONITOR_LAST_SEGMENT_RECORDED; seg++ )); do
+        if [ -n "${MONITOR_SEG_MP4[$seg]:-}" ] && [ -n "${MONITOR_FLAGGED_SEGMENTS[$seg]:-}" ]; then
+            monitor_promote_segment "$seg"
+        fi
+    done
+}
+
+monitor_clean_cc_text() {
+    local srt_file="$1"
+    local txt_file="$2"
+    python3 - <<'PY' "$srt_file" "$txt_file"
+import re
+import sys
+
+srt_path, txt_path = sys.argv[1:3]
+text_lines = []
+try:
+    with open(srt_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line:
+                continue
+            if line.isdigit():
+                continue
+            if "-->" in line:
+                continue
+            line = re.sub(r"^>+\s*", "", line)
+            line = re.sub(r"^[A-Z][A-Z0-9 .&'/:-]{1,40}:\s*", "", line)
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                text_lines.append(line)
+except FileNotFoundError:
+    pass
+
+with open(txt_path, "w", encoding="utf-8") as fh:
+    if text_lines:
+        fh.write("\n".join(text_lines) + "\n")
+PY
+}
+
+monitor_detect_keyword_hit() {
+    local txt_file="$1"
+    local keywords_file="$2"
+    python3 - <<'PY' "$txt_file" "$keywords_file"
+import sys
+
+txt_path, keywords_path = sys.argv[1:3]
+try:
+    with open(keywords_path, "r", encoding="utf-8", errors="replace") as fh:
+        keywords = [line.strip() for line in fh if line.strip()]
+except FileNotFoundError:
+    sys.exit(1)
+
+try:
+    with open(txt_path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = [line.strip() for line in fh if line.strip()]
+except FileNotFoundError:
+    sys.exit(1)
+
+lowered_keywords = [(kw, kw.lower()) for kw in keywords]
+for line in lines:
+    low_line = line.lower()
+    for original, low_kw in lowered_keywords:
+        if low_kw in low_line:
+            print(f"{original}\t{line}")
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+monitor_try_live_cc_method() {
+    local method="$1"
+    local out_file="$2"
+    local duration="$3"
+    local log_file="$4"
+    case "$method" in
+        subtitle-map)
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MASTER_URL" -t "$duration" -map 0:s:0? -c:s srt "$out_file" \
+                > /dev/null 2>"$log_file"
+            ;;
+        subtitle-codec-map)
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$duration" -codec:s srt -map 0:s? "$out_file" \
+                > /dev/null 2>"$log_file"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+monitor_extract_cc_from_file() {
+    local method="$1"
+    local input_file="$2"
+    local out_file="$3"
+    local log_file="$4"
+    case "$method" in
+        lavfi-subcc)
+            ffmpeg -y -f lavfi -i "movie=${input_file}[out+subcc]" -map 0:s -c:s srt "$out_file" \
+                > /dev/null 2>"$log_file"
+            ;;
+        extractcc-filter)
+            if ffmpeg -hide_banner -filters | grep -q ' extractcc '; then
+                ffmpeg -y -i "$input_file" -filter_complex "[0:v]extractcc[sub]" -map "[sub]" -c:s srt "$out_file" \
+                    > /dev/null 2>"$log_file"
+            else
+                printf 'extractcc filter not available in this ffmpeg build.\n' > "$log_file"
+                return 1
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+monitor_refresh_stream_targets() {
+    local refreshed_content refreshed_best refreshed_summary
+    refreshed_content=$(curl -fsSL -A "$HTTP_USER_AGENT" "$MASTER_URL" 2>/dev/null) || return 1
+    MONITOR_HAS_CC_DECLARED=0
+    MONITOR_HAS_SUBTITLE_DECLARED=0
+    echo "$refreshed_content" | grep -q 'TYPE=CLOSED-CAPTIONS' && MONITOR_HAS_CC_DECLARED=1
+    echo "$refreshed_content" | grep -q 'TYPE=SUBTITLES' && MONITOR_HAS_SUBTITLE_DECLARED=1
+    refreshed_best=$(echo "$refreshed_content" | python3 - <<'PY' "$MASTER_URL"
+import sys
+from urllib.parse import urljoin
+
+master_url = sys.argv[1]
+lines = sys.stdin.read().strip().splitlines()
+variants = []
+i = 0
+while i < len(lines):
+    line = lines[i].strip()
+    if line.startswith("#EXT-X-STREAM-INF:"):
+        attrs = line.split(":", 1)[1]
+        bandwidth = 0
+        for part in attrs.split(","):
+            part = part.strip()
+            if part.startswith("BANDWIDTH="):
+                try:
+                    bandwidth = int(part.split("=", 1)[1])
+                except ValueError:
+                    bandwidth = 0
+        j = i + 1
+        while j < len(lines) and lines[j].strip().startswith("#"):
+            j += 1
+        if j < len(lines):
+            variants.append((bandwidth, urljoin(master_url, lines[j].strip())))
+        i = j
+    i += 1
+
+variants.sort(reverse=True)
+print(variants[0][1] if variants else "")
+PY
+)
+    [ -n "$refreshed_best" ] || return 1
+    MONITOR_BEST_URL="$refreshed_best"
+    refreshed_summary=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -print_format json -show_format -show_streams -i "$MONITOR_BEST_URL" 2>/dev/null \
+        | python3 - <<'PY'
+import json
+import sys
+
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+
+video = next((stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"), None)
+fmt = data.get("format") or {}
+if not video:
+    sys.exit(0)
+codec = video.get("codec_name", "?")
+width = video.get("width", "?")
+height = video.get("height", "?")
+bit_rate = fmt.get("bit_rate") or video.get("bit_rate") or ""
+bit_rate_txt = ""
+if bit_rate:
+    try:
+        bit_rate_txt = f" @ {int(bit_rate)//1000} kbps"
+    except Exception:
+        bit_rate_txt = ""
+print(f"{width}x{height} {codec}{bit_rate_txt}")
+PY
+)
+    [ -n "$refreshed_summary" ] && MONITOR_STREAM_SUMMARY="$refreshed_summary"
+    return 0
+}
+
+monitor_detect_cc_method() {
+    local requested_method="$1"
+    local diag_sec=12
+    local temp_dir live_srt live_log sample_ts sample_log file_srt file_log
+
+    if [ "$requested_method" != "auto" ]; then
+        printf '%s\n' "$requested_method"
+        return 0
+    fi
+
+    temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/monitor-cc.XXXXXX")"
+    track_temp_file "$temp_dir"
+
+    live_srt="${temp_dir}/subtitle-map.srt"
+    live_log="${temp_dir}/subtitle-map.log"
+    if monitor_try_live_cc_method "subtitle-map" "$live_srt" "$diag_sec" "$live_log" && [ -s "$live_srt" ]; then
+        printf 'subtitle-map\n'
+        return 0
+    fi
+
+    live_srt="${temp_dir}/subtitle-codec-map.srt"
+    live_log="${temp_dir}/subtitle-codec-map.log"
+    if monitor_try_live_cc_method "subtitle-codec-map" "$live_srt" "$diag_sec" "$live_log" && [ -s "$live_srt" ]; then
+        printf 'subtitle-codec-map\n'
+        return 0
+    fi
+
+    sample_ts="${temp_dir}/sample.ts"
+    sample_log="${temp_dir}/sample.log"
+    if ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$diag_sec" -map 0:v:0 -map 0:a? -c copy -f mpegts "$sample_ts" \
+        > /dev/null 2>"$sample_log"; then
+        file_srt="${temp_dir}/lavfi-subcc.srt"
+        file_log="${temp_dir}/lavfi-subcc.log"
+        if monitor_extract_cc_from_file "lavfi-subcc" "$sample_ts" "$file_srt" "$file_log" && [ -s "$file_srt" ]; then
+            printf 'lavfi-subcc\n'
+            return 0
+        fi
+
+        file_srt="${temp_dir}/extractcc-filter.srt"
+        file_log="${temp_dir}/extractcc-filter.log"
+        if monitor_extract_cc_from_file "extractcc-filter" "$sample_ts" "$file_srt" "$file_log" && [ -s "$file_srt" ]; then
+            printf 'extractcc-filter\n'
+            return 0
+        fi
+    fi
+
+    printf 'none\n'
+}
+
+monitor_render_status() {
+    local elapsed buffer_count buffer_limit buffer_bytes kept_bytes preview status_lines
+    local match_id start end keyword summary_line
+
+    if [ "$QUIET" -eq 1 ] || [ ! -t 1 ]; then
+        return 0
+    fi
+
+    elapsed=$(( $(date +%s) - MONITOR_START_EPOCH ))
+    buffer_count=0
+    for _ in "${!MONITOR_SEG_MP4[@]}"; do
+        buffer_count=$((buffer_count + 1))
+    done
+    buffer_limit=$((MONITOR_BUFFER_DEPTH * 2 + 1))
+    buffer_bytes=$(sum_dir_bytes "$MONITOR_BUFFER_DIR")
+    kept_bytes=$(sum_dir_bytes "$MONITOR_KEPT_DIR")
+    preview="${MONITOR_LAST_CC_PREVIEW:-"(no caption text yet)"}"
+
+    if [ "$MONITOR_STATUS_LINES" -gt 0 ]; then
+        printf '\033[%dA' "$MONITOR_STATUS_LINES"
+    fi
+    printf '\033[J'
+
+    status_lines=0
+    echo -e "  ${BG_Y} MONITOR ${NC}  ${B}segment #${MONITOR_LAST_SEGMENT_RECORDED}${NC}  ${D}$(format_elapsed_compact "$elapsed") elapsed${NC}  ${B}${MONITOR_MATCHES_FOUND} matches${NC}"
+    status_lines=$((status_lines + 1))
+    echo -e "  Buffer: [$(draw_bar $(( buffer_count * 100 / (buffer_limit > 0 ? buffer_limit : 1) )) 10)] ${buffer_count}/${buffer_limit} slots    Disk: $(human_size "$buffer_bytes") (buffer) + $(human_size "$kept_bytes") (kept)"
+    status_lines=$((status_lines + 1))
+    echo -e "  CC Method: ${MONITOR_CC_METHOD}    Last CC: \"${preview:0:80}\""
+    status_lines=$((status_lines + 1))
+    echo "  Matches:"
+    status_lines=$((status_lines + 1))
+    for (( match_id=NEXT_MONITOR_MATCH_ID-1; match_id>=1 && match_id>=NEXT_MONITOR_MATCH_ID-3; match_id-- )); do
+        [ -n "${MONITOR_MATCH_START[$match_id]:-}" ] || continue
+        start="$(format_seg_num "${MONITOR_MATCH_START[$match_id]}")"
+        end="$(format_seg_num "${MONITOR_MATCH_END[$match_id]}")"
+        keyword="$(printf '%s\n' "${MONITOR_MATCH_KEYWORDS[$match_id]}" | head -n 1)"
+        summary_line="    #${match_id}  seg ${start}-${end}  \"${keyword}\"  ${MONITOR_MATCH_FIRST_TS[$match_id]}"
+        if [ "${MONITOR_MATCH_FINALIZED[$match_id]:-0}" -eq 1 ]; then
+            summary_line="${summary_line}  → $(basename "${MONITOR_MATCH_DIR[$match_id]}")/"
+        else
+            summary_line="${summary_line}  → pending"
+        fi
+        echo "$summary_line"
+        status_lines=$((status_lines + 1))
+    done
+    MONITOR_STATUS_LINES="$status_lines"
+}
+
+monitor_disk_guard() {
+    local free_kb
+    local seg
+
+    free_kb=$(disk_free_kb "$OUT_DIR")
+    [ -n "$free_kb" ] || return 0
+
+    if [ "$free_kb" -lt 1048576 ]; then
+        monitor_log "WARNING: disk below 1 GB free — forcing buffer flush"
+        for (( seg=1; seg<=MONITOR_LAST_SEGMENT_RECORDED; seg++ )); do
+            [ -n "${MONITOR_SEG_MP4[$seg]:-}" ] || continue
+            if [ -n "${MONITOR_FLAGGED_SEGMENTS[$seg]:-}" ]; then
+                monitor_promote_segment "$seg"
+            else
+                monitor_cleanup_buffer_segment "$seg" "low disk flush"
+            fi
+        done
+    fi
+
+    free_kb=$(disk_free_kb "$OUT_DIR")
+    while [ -n "$free_kb" ] && [ "$free_kb" -lt 512000 ]; do
+        monitor_log "WARNING: disk below 500 MB free — pausing recording"
+        echo -e "  ${R}⚠ Disk space below 500 MB. Monitor mode paused until space recovers.${NC}"
+        sleep 30
+        free_kb=$(disk_free_kb "$OUT_DIR")
+    done
+}
+
+monitor_record_segment() {
+    local seg="$1"
+    local mp4_file="${MONITOR_BUFFER_DIR}/seg_$(format_seg_num "$seg").mp4"
+    local srt_file="${MONITOR_BUFFER_DIR}/seg_$(format_seg_num "$seg").srt"
+    local txt_file="${MONITOR_BUFFER_DIR}/seg_$(format_seg_num "$seg").txt"
+    local vlog clog stall_marker watchdog_pid video_pid cc_pid kp cc_lines bytes matched keyword line match_id
+
+    vlog=$(make_temp_file monitor-vid)
+    clog=$(make_temp_file monitor-cc)
+    stall_marker=$(make_temp_file monitor-stall)
+    track_temp_file "$vlog"
+    track_temp_file "$clog"
+    track_temp_file "$stall_marker"
+
+    ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$MONITOR_SEGMENT_SEC" \
+        -c:v copy -c:a copy -movflags +faststart -loglevel warning -stats \
+        "$mp4_file" 2>"$vlog" &
+    video_pid=$!
+    track_pid "$video_pid"
+    watchdog_pid=$(start_timeout_watchdog "$video_pid" "$((MONITOR_SEGMENT_SEC * SEGMENT_TIMEOUT_MULTIPLIER))" "$stall_marker")
+    track_pid "$watchdog_pid"
+
+    cc_pid=""
+    case "$MONITOR_CC_METHOD" in
+        subtitle-map)
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MASTER_URL" -t "$MONITOR_SEGMENT_SEC" -map 0:s:0? -c:s srt "$srt_file" \
+                > /dev/null 2>"$clog" &
+            cc_pid=$!
+            track_pid "$cc_pid"
+            ;;
+        subtitle-codec-map)
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$MONITOR_SEGMENT_SEC" -codec:s srt -map 0:s? "$srt_file" \
+                > /dev/null 2>"$clog" &
+            cc_pid=$!
+            track_pid "$cc_pid"
+            ;;
+    esac
+
+    while kill -0 "$video_pid" 2>/dev/null; do
+        sleep 1
+    done
+
+    wait "$video_pid"; VEC=$?
+    forget_pid "$video_pid"
+    stop_timeout_watchdog "$watchdog_pid"
+
+    if [ -n "$cc_pid" ]; then
+        ( sleep 8; kill "$cc_pid" 2>/dev/null ) &
+        kp=$!
+        wait "$cc_pid" 2>/dev/null || true
+        forget_pid "$cc_pid"
+        kill "$kp" 2>/dev/null || true
+        wait "$kp" 2>/dev/null || true
+    fi
+
+    if [ "$VEC" -ne 0 ] || [ ! -s "$mp4_file" ]; then
+        if [ -s "$stall_marker" ]; then
+            monitor_log "WARNING: SEG $(format_seg_num "$seg") hit timeout while recording"
+        fi
+        rm -f "$mp4_file" "$srt_file" "$txt_file"
+        forget_temp_file "$vlog"
+        forget_temp_file "$clog"
+        forget_temp_file "$stall_marker"
+        rm -f "$vlog" "$clog" "$stall_marker"
+        monitor_log "SEG $(format_seg_num "$seg") failed — waiting 10s before reconnect"
+        sleep 10
+        if monitor_refresh_stream_targets; then
+            monitor_log "STREAM REFRESH OK — resumed with ${MONITOR_BEST_URL}"
+        else
+            monitor_log "WARNING: stream refresh failed after segment error"
+        fi
+        return 1
+    fi
+
+    case "$MONITOR_CC_METHOD" in
+        lavfi-subcc|extractcc-filter)
+            monitor_extract_cc_from_file "$MONITOR_CC_METHOD" "$mp4_file" "$srt_file" "$clog" || true
+            ;;
+        none)
+            : > "$srt_file"
+            ;;
+    esac
+
+    [ -f "$srt_file" ] || : > "$srt_file"
+    monitor_clean_cc_text "$srt_file" "$txt_file"
+
+    MONITOR_SEG_MP4[$seg]="$mp4_file"
+    MONITOR_SEG_SRT[$seg]="$srt_file"
+    MONITOR_SEG_TXT[$seg]="$txt_file"
+    bytes=$(file_size_bytes "$mp4_file" 2>/dev/null || printf '0')
+    cc_lines=$(count_nonempty_lines "$txt_file")
+    monitor_log "SEG $(format_seg_num "$seg") recorded — $(human_size "$bytes") — CC: ${cc_lines} lines"
+
+    if [ "$cc_lines" -gt 0 ]; then
+        MONITOR_EMPTY_CC_STREAK=0
+        while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            monitor_log "SEG $(format_seg_num "$seg") CC: $line"
+            MONITOR_LAST_CC_PREVIEW="$line"
+        done < "$txt_file"
+    else
+        MONITOR_EMPTY_CC_STREAK=$((MONITOR_EMPTY_CC_STREAK + 1))
+        MONITOR_LAST_CC_PREVIEW="(no caption text)"
+        if [ "$MONITOR_EMPTY_CC_STREAK" -eq 10 ]; then
+            monitor_log "WARNING: CC stream appears to have gone silent"
+        fi
+    fi
+
+    if [ "$MONITOR_CC_METHOD" != "none" ] && matched=$(monitor_detect_keyword_hit "$txt_file" "$MONITOR_KEYWORDS_FILE"); then
+        keyword="${matched%%	*}"
+        line="${matched#*	}"
+        match_id=$(monitor_register_match "$seg" "$keyword" "$line" "$MONITOR_BUFFER_DEPTH")
+        monitor_log "★ KEYWORD HIT in SEG $(format_seg_num "$seg"): \"${keyword}\" — line: \"${line}\""
+        monitor_log "FLAGGED segments $(format_seg_num "${MONITOR_MATCH_START[$match_id]}")-$(format_seg_num "${MONITOR_MATCH_END[$match_id]}") for retention"
+    else
+        monitor_log "SEG $(format_seg_num "$seg") — no keyword match — buffer OK"
+    fi
+
+    rm -f "$vlog" "$clog" "$stall_marker"
+    forget_temp_file "$vlog"
+    forget_temp_file "$clog"
+    forget_temp_file "$stall_marker"
+    return 0
+}
+
+monitor_print_summary() {
+    local kept_dirs
+    kept_dirs=$(find "$MONITOR_KEPT_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    echo ""
+    echo -e "${C}${B}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${C}${B}║  Keyword Monitor Complete — $(date +%H:%M:%S)                 ║${NC}"
+    echo -e "${C}${B}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${B}Segments${NC}    ${MONITOR_LAST_SEGMENT_RECORDED}"
+    echo -e "  ${B}Matches${NC}     ${MONITOR_MATCHES_FOUND}"
+    echo -e "  ${B}Kept folders${NC} ${kept_dirs}"
+    echo -e "  ${B}Location${NC}    ${OUT_DIR}/"
+    MONITOR_SUMMARY_PRINTED=1
+}
+
+monitor_cleanup_on_exit() {
+    local exit_code="$1"
+    [ "$MONITOR_ACTIVE" -eq 1 ] || return 0
+    [ "$MONITOR_INTERRUPTED" -eq 1 ] || return 0
+    [ "$MONITOR_SUMMARY_PRINTED" -eq 0 ] || return 0
+
+    monitor_log "MONITOR INTERRUPTED — promoting flagged buffer segments before exit"
+    monitor_finalize_flagged_segments
+    monitor_finalize_ready_matches "$((MONITOR_LAST_SEGMENT_RECORDED + MONITOR_BUFFER_DEPTH + 1))" 1
+    monitor_print_summary
+    return "$exit_code"
+}
+
+run_keyword_monitor() {
+    local keyword_count selected_method choice check_seg
+
+    MONITOR_ACTIVE=1
+    MONITOR_START_EPOCH=$(date +%s)
+    MONITOR_BUFFER_DEPTH=$(((MONITOR_BUFFER_SEC + MONITOR_SEGMENT_SEC - 1) / MONITOR_SEGMENT_SEC))
+    [ -z "$OUTPUT_OVERRIDE" ] && OUT_DIR="$DEFAULT_MONITOR_OUTPUT_DIR"
+    MONITOR_BUFFER_DIR="${OUT_DIR}/buffer"
+    MONITOR_KEPT_DIR="${OUT_DIR}/kept"
+    MONITOR_LOG_FILE="${OUT_DIR}/monitor.log"
+    mkdir -p "$MONITOR_BUFFER_DIR" "$MONITOR_KEPT_DIR"
+
+    if [ ! -f "$MONITOR_KEYWORDS_FILE" ]; then
+        echo -e "${R}✗ Keywords file not found: ${MONITOR_KEYWORDS_FILE}${NC}"
+        return 1
+    fi
+    keyword_count=$(grep -c '[^[:space:]]' "$MONITOR_KEYWORDS_FILE" 2>/dev/null || printf '0')
+
+    MONITOR_BEST_URL="$BEST_URL"
+    monitor_refresh_stream_targets || true
+    MONITOR_STREAM_SUMMARY="${MONITOR_STREAM_SUMMARY:-1080p stream}"
+
+    echo -e "  ${Y}${B}⚡ KEYWORD MONITOR MODE (experimental)${NC}"
+    echo ""
+    echo -e "  ${B}Keywords${NC}    $(monitor_keywords_display "$(cat "$MONITOR_KEYWORDS_FILE")")"
+    echo -e "  ${B}Source${NC}      $(basename "$MONITOR_KEYWORDS_FILE") (${keyword_count} phrases)"
+    echo -e "  ${B}Buffer${NC}      ${MONITOR_BUFFER_MINUTES} min before + ${MONITOR_BUFFER_MINUTES} min after match"
+    echo -e "  ${B}Segments${NC}    $((MONITOR_SEGMENT_SEC / 60)).$(( (MONITOR_SEGMENT_SEC % 60) / 10 )) min each"
+    echo -e "  ${B}Run until${NC}   ${MONITOR_UNTIL_RAW:-Ctrl+C}"
+    echo ""
+    echo -e "  ${Y}⚠ This mode requires working closed captions.${NC}"
+    echo -e "    Running CC diagnostic first..."
+
+    selected_method=$(monitor_detect_cc_method "$MONITOR_CC_METHOD")
+    MONITOR_CC_METHOD="$selected_method"
+    if [ "$MONITOR_CC_METHOD" = "none" ]; then
+        echo -e "    ${Y}⚠ No closed captions detected — keyword monitoring will not work${NC}"
+        echo -e "    ${D}This stream advertises CC metadata, but ffmpeg did not decode usable text in the diagnostic.${NC}"
+        monitor_log "WARNING: No closed captions detected — keyword monitoring will not work"
+        if [ -t 0 ] && [ "$MONITOR_FLAG" -eq 0 ]; then
+            read -rp "    Continue monitor mode anyway, or switch to scheduled mode? [m/s]: " choice
+            if [ "$choice" = "s" ] || [ "$choice" = "S" ]; then
+                MONITOR_ACTIVE=0
+                set_default_windows
+                NUM_WINDOWS=${#WIN_STARTS[@]}
+                [ -z "$OUTPUT_OVERRIDE" ] && OUT_DIR="$DEFAULT_OUTPUT_DIR"
+                mkdir -p "$OUT_DIR"
+                echo ""
+                echo -e "  ${B}Recording windows:${NC}"
+                for (( w=0; w<NUM_WINDOWS; w++ )); do
+                    echo -e "    ${G}▸${NC} ${WIN_LABELS[$w]}"
+                done
+                echo -e "  ${B}Save to${NC}    ${OUT_DIR}/"
+                echo -e "  ${B}Captions${NC}   .srt per segment (if available)"
+                echo ""
+                return 42
+            fi
+        fi
+    else
+        echo -e "    ${G}✓${NC} Captions detected via ${MONITOR_CC_METHOD} — monitor is GO"
+    fi
+
+    monitor_log "MONITOR START — ${keyword_count} keywords loaded"
+    monitor_log "CC METHOD: ${MONITOR_CC_METHOD}"
+    monitor_log "STREAM: ${MONITOR_STREAM_SUMMARY}"
+
+    while true; do
+        if [ -n "$MONITOR_UNTIL_SEC" ] && [ "$(now_seconds_of_day)" -ge "$MONITOR_UNTIL_SEC" ]; then
+            monitor_log "MONITOR STOP — reached --until ${MONITOR_UNTIL_RAW}"
+            break
+        fi
+
+        MONITOR_LAST_SEGMENT_RECORDED=$((MONITOR_LAST_SEGMENT_RECORDED + 1))
+        monitor_record_segment "$MONITOR_LAST_SEGMENT_RECORDED" || {
+            monitor_render_status
+            continue
+        }
+
+        check_seg=$((MONITOR_LAST_SEGMENT_RECORDED - MONITOR_BUFFER_DEPTH - 1))
+        if [ "$check_seg" -ge 1 ] && [ -n "${MONITOR_SEG_MP4[$check_seg]:-}" ]; then
+            if [ -n "${MONITOR_FLAGGED_SEGMENTS[$check_seg]:-}" ]; then
+                monitor_promote_segment "$check_seg"
+            else
+                monitor_cleanup_buffer_segment "$check_seg" "buffer expired, not flagged"
+            fi
+        fi
+
+        if [ $((MONITOR_LAST_SEGMENT_RECORDED % 10)) -eq 0 ]; then
+            monitor_disk_guard
+        fi
+
+        monitor_finalize_ready_matches "$MONITOR_LAST_SEGMENT_RECORDED" 0
+        monitor_render_status
+    done
+
+    monitor_finalize_flagged_segments
+    monitor_finalize_ready_matches "$((MONITOR_LAST_SEGMENT_RECORDED + MONITOR_BUFFER_DEPTH + 1))" 1
+    monitor_print_summary
+    open_output_dir "$OUT_DIR"
+    return 0
+}
+
 POSITIONAL_URL=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -291,7 +1205,7 @@ done
 
 [ -z "$MASTER_URL" ] || [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
 MASTER_URL="${MASTER_URL:-${POSITIONAL_URL:-$DEFAULT_MASTER_URL}}"
-OUT_DIR="${OUTPUT_OVERRIDE:-${SCRIPT_DIR}/recording_$(date +%Y%m%d)}"
+OUT_DIR="${OUTPUT_OVERRIDE:-$DEFAULT_OUTPUT_DIR}"
 
 # ══════════════════════════════════════════════════════════
 # MODE SELECTION
@@ -310,8 +1224,9 @@ echo ""
 echo -e "    ${W}1)${NC}  Scheduled — 5:55p→7:00p  then  9:55p→11:00p"
 echo -e "    ${W}2)${NC}  Record now — enter a custom duration"
 echo -e "    ${W}3)${NC}  Record now — enter start & end times"
+echo -e "    ${W}4)${NC}  ⚡ Keyword monitor ${Y}(experimental)${NC} — record on keyword detection"
 echo ""
-read -rp "  Select [1/2/3]: " MODE_CHOICE
+read -rp "  Select [1/2/3/4]: " MODE_CHOICE
 echo ""
 
 # Build the list of recording windows based on mode
@@ -320,6 +1235,9 @@ declare -a WIN_ENDS=()     # end times in seconds-since-midnight
 declare -a WIN_LABELS=()   # display labels
 
 case "$MODE_CHOICE" in
+    4)
+        [ -z "$OUTPUT_OVERRIDE" ] && OUT_DIR="$DEFAULT_MONITOR_OUTPUT_DIR"
+        ;;
     2)
         read -rp "  How many minutes to record? " CUSTOM_MINS
         if ! [[ "$CUSTOM_MINS" =~ ^[0-9]+$ ]]; then
@@ -360,22 +1278,18 @@ case "$MODE_CHOICE" in
         ;;
     *)
         # Default: scheduled windows
-        WIN_STARTS+=("$((WIN1_START_HOUR*3600 + WIN1_START_MIN*60))")
-        WIN_ENDS+=("$((WIN1_END_HOUR*3600 + WIN1_END_MIN*60))")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN1_START_HOUR" "$WIN1_START_MIN" "$WIN1_END_HOUR" "$WIN1_END_MIN")")
-
-        WIN_STARTS+=("$((WIN2_START_HOUR*3600 + WIN2_START_MIN*60))")
-        WIN_ENDS+=("$((WIN2_END_HOUR*3600 + WIN2_END_MIN*60))")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN2_START_HOUR" "$WIN2_START_MIN" "$WIN2_END_HOUR" "$WIN2_END_MIN")")
+        set_default_windows
         ;;
 esac
 
 NUM_WINDOWS=${#WIN_STARTS[@]}
 
-echo -e "  ${B}Recording windows:${NC}"
-for (( w=0; w<NUM_WINDOWS; w++ )); do
-    echo -e "    ${G}▸${NC} ${WIN_LABELS[$w]}"
-done
+if [ "$MODE_CHOICE" != "4" ]; then
+    echo -e "  ${B}Recording windows:${NC}"
+    for (( w=0; w<NUM_WINDOWS; w++ )); do
+        echo -e "    ${G}▸${NC} ${WIN_LABELS[$w]}"
+    done
+fi
 echo -e "  ${B}Save to${NC}    ${OUT_DIR}/"
 echo -e "  ${B}Captions${NC}   .srt per segment (if available)"
 echo ""
@@ -556,6 +1470,16 @@ else
 fi
 echo -e "${B}────────────────────────────────────────────────────────────${NC}"
 echo ""
+
+if [ "$MODE_CHOICE" = "4" ]; then
+    run_keyword_monitor
+    MONITOR_RC=$?
+    if [ "$MONITOR_RC" -eq 42 ]; then
+        MODE_CHOICE=1
+    else
+        exit "$MONITOR_RC"
+    fi
+fi
 
 # ══════════════════════════════════════════════════════════
 # PHASE 1: TEST (using best variant URL)
