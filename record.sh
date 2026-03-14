@@ -8,9 +8,12 @@
 # All files saved next to this script
 # ─────────────────────────────────────────────────────────
 
-MASTER_URL="${1:-https://example.com/stream/index.m3u8}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OUT_DIR="${SCRIPT_DIR}/recording_$(date +%Y%m%d)"
+DEFAULT_MASTER_URL="https://example.com/stream/index.m3u8"
+MASTER_URL=""
+OUT_DIR=""
+OUTPUT_OVERRIDE=""
+QUIET=0
 
 SEGMENT_SEC=300  # 5 minutes
 TEST_SEC=15
@@ -185,10 +188,89 @@ parse_time() {
     printf '%s\n' "$((hour * 3600 + minute * 60))"
 }
 
+print_usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] [url]
+
+Record an HLS stream at the highest available quality.
+
+Options:
+  -h, --help          Show this help text and exit
+  -q, --quiet         Suppress progress animations
+      --url URL       Use URL as the HLS master playlist
+      --output DIR    Write recordings to DIR
+
+Arguments:
+  url                 HLS master playlist URL (same as --url)
+
+Examples:
+  $(basename "$0") https://your-stream.com/index.m3u8
+  $(basename "$0") --url https://your-stream.com/index.m3u8 --output /tmp/capture
+  echo 1 | $(basename "$0") --quiet https://your-stream.com/index.m3u8
+EOF
+}
+
+POSITIONAL_URL=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        -q|--quiet)
+            QUIET=1
+            ;;
+        --url)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --url${NC}"; exit 1; }
+            [ -z "$MASTER_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+            MASTER_URL="$2"
+            shift
+            ;;
+        --url=*)
+            [ -z "$MASTER_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+            MASTER_URL="${1#*=}"
+            ;;
+        --output)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --output${NC}"; exit 1; }
+            OUTPUT_OVERRIDE="$2"
+            shift
+            ;;
+        --output=*)
+            OUTPUT_OVERRIDE="${1#*=}"
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo -e "${R}✗ Unknown option: $1${NC}"
+            print_usage
+            exit 1
+            ;;
+        *)
+            [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+            POSITIONAL_URL="$1"
+            ;;
+    esac
+    shift
+done
+
+while [ "$#" -gt 0 ]; do
+    [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+    POSITIONAL_URL="$1"
+    shift
+done
+
+[ -z "$MASTER_URL" ] || [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+MASTER_URL="${MASTER_URL:-${POSITIONAL_URL:-$DEFAULT_MASTER_URL}}"
+OUT_DIR="${OUTPUT_OVERRIDE:-${SCRIPT_DIR}/recording_$(date +%Y%m%d)}"
+
 # ══════════════════════════════════════════════════════════
 # MODE SELECTION
 # ══════════════════════════════════════════════════════════
-clear
+if [ "$QUIET" -eq 0 ] && [ -t 1 ]; then
+    clear
+fi
 echo -e "${C}${B}╔═══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${C}${B}║          📡  HLS Stream Recorder  —  MAX QUALITY         ║${NC}"
 echo -e "${C}${B}╚═══════════════════════════════════════════════════════════╝${NC}"
@@ -452,6 +534,9 @@ echo ""
 # ══════════════════════════════════════════════════════════
 echo -e "${BG_C} PHASE 1 ${NC}  ${B}Quality Test (${TEST_SEC}s)${NC}"
 echo ""
+if [ "$QUIET" -eq 1 ]; then
+    echo -e "  ${D}Running quality test capture...${NC}"
+fi
 
 TEST_FILE="${OUT_DIR}/_test.mp4"
 TLOG=$(make_temp_file fftest)
@@ -467,24 +552,27 @@ track_pid "$TPID"
 SI=0; TS=$(date +%s)
 
 while kill -0 "$TPID" 2>/dev/null; do
-    E=$(( $(date +%s) - TS ))
-    R=$((TEST_SEC - E)); [ "$R" -lt 0 ] && R=0
-    PCT=$((E * 100 / TEST_SEC)); [ "$PCT" -gt 100 ] && PCT=100
-    if TEST_BYTES=$(file_size_bytes "$TEST_FILE" 2>/dev/null); then
-        SZ=$(human_size "$TEST_BYTES")
-    else
-        SZ="..."
+    if [ "$QUIET" -eq 0 ]; then
+        E=$(( $(date +%s) - TS ))
+        R=$((TEST_SEC - E)); [ "$R" -lt 0 ] && R=0
+        PCT=$((E * 100 / TEST_SEC)); [ "$PCT" -gt 100 ] && PCT=100
+        if TEST_BYTES=$(file_size_bytes "$TEST_FILE" 2>/dev/null); then
+            SZ=$(human_size "$TEST_BYTES")
+        else
+            SZ="..."
+        fi
+        BAR=$(draw_bar "$PCT" 25)
+        printf "\r  ${G}${SPIN[$SI]}${NC} TEST [${G}${BAR}${NC}] %3d%%  ${C}%02ds${NC}/${TEST_SEC}s  ${B}%s${NC}   " "$PCT" "$E" "$SZ"
+        SI=$(( (SI+1) % 10 ))
     fi
-    BAR=$(draw_bar "$PCT" 25)
-    printf "\r  ${G}${SPIN[$SI]}${NC} TEST [${G}${BAR}${NC}] %3d%%  ${C}%02ds${NC}/${TEST_SEC}s  ${B}%s${NC}   " "$PCT" "$E" "$SZ"
-    SI=$(( (SI+1) % 10 )); sleep 1
+    sleep 1
 done
 
 wait "$TPID"; TEC=$?
 forget_pid "$TPID"
 rm -f "$TLOG"
 forget_temp_file "$TLOG"
-echo ""
+[ "$QUIET" -eq 0 ] && echo ""
 
 if [ "$TEC" -eq 0 ] && [ -f "$TEST_FILE" ]; then
     TB=$(wc -c < "$TEST_FILE" | tr -d ' ')
@@ -555,15 +643,21 @@ record_window() {
     echo ""
 
     # ── Wait for this window's start ──
+    WAIT_LOGGED=0
     while true; do
         NOW=$(now_seconds_of_day)
         [ "$NOW" -ge "$WIN_START_SEC" ] && break
         W=$((WIN_START_SEC - NOW))
-        printf "\r  ${Y}⏳ Recording at %02d:%02d — %02d:%02d remaining ...${NC}   " \
-            "$SH" "$SM" $((W/60)) $((W%60))
+        if [ "$QUIET" -eq 0 ]; then
+            printf "\r  ${Y}⏳ Recording at %02d:%02d — %02d:%02d remaining ...${NC}   " \
+                "$SH" "$SM" $((W/60)) $((W%60))
+        elif [ "$WAIT_LOGGED" -eq 0 ]; then
+            echo -e "  ${D}Waiting for recording window at $(printf '%02d:%02d' "$SH" "$SM")${NC}"
+            WAIT_LOGGED=1
+        fi
         sleep 1
     done
-    echo ""
+    [ "$QUIET" -eq 0 ] && echo ""
 
     echo -e "${BG_G} RECORD ${NC}  ${B}${NUM_SEGMENTS} × $(( SEGMENT_SEC/60 ))min segments  [1080p]${NC}"
     echo ""
@@ -622,25 +716,28 @@ record_window() {
 
             SI=0
             while kill -0 "$VID_PID" 2>/dev/null; do
-                E=$(( $(date +%s) - SEG_TS ))
-                R=$((THIS_SEG_SEC - E)); [ "$R" -lt 0 ] && R=0
-                PCT=$((E * 100 / THIS_SEG_SEC)); [ "$PCT" -gt 100 ] && PCT=100
+                if [ "$QUIET" -eq 0 ]; then
+                    E=$(( $(date +%s) - SEG_TS ))
+                    R=$((THIS_SEG_SEC - E)); [ "$R" -lt 0 ] && R=0
+                    PCT=$((E * 100 / THIS_SEG_SEC)); [ "$PCT" -gt 100 ] && PCT=100
 
-                GPCT=$(( ((i-1)*SEGMENT_SEC + E) * 100 / TOTAL_SEC ))
-                [ "$GPCT" -gt 100 ] && GPCT=100
+                    GPCT=$(( ((i-1)*SEGMENT_SEC + E) * 100 / TOTAL_SEC ))
+                    [ "$GPCT" -gt 100 ] && GPCT=100
 
-                if SEG_BYTES=$(file_size_bytes "$SEG_FILE" 2>/dev/null); then
-                    SZ=$(human_size "$SEG_BYTES")
-                else
-                    SZ="..."
+                    if SEG_BYTES=$(file_size_bytes "$SEG_FILE" 2>/dev/null); then
+                        SZ=$(human_size "$SEG_BYTES")
+                    else
+                        SZ="..."
+                    fi
+
+                    BAR=$(draw_bar "$PCT" 25)
+                    GBAR=$(draw_bar "$GPCT" 20)
+
+                    printf "\r  ${G}${SPIN[$SI]}${NC} seg [${G}${BAR}${NC}] %3d%%  ${C}%d:%02d${NC}  ${B}%s${NC}  │  win [${Y}${GBAR}${NC}] %3d%%  " \
+                        "$PCT" "$((E/60))" "$((E%60))" "$SZ" "$GPCT"
+                    SI=$(( (SI+1) % 10 ))
                 fi
-
-                BAR=$(draw_bar "$PCT" 25)
-                GBAR=$(draw_bar "$GPCT" 20)
-
-                printf "\r  ${G}${SPIN[$SI]}${NC} seg [${G}${BAR}${NC}] %3d%%  ${C}%d:%02d${NC}  ${B}%s${NC}  │  win [${Y}${GBAR}${NC}] %3d%%  " \
-                    "$PCT" "$((E/60))" "$((E%60))" "$SZ" "$GPCT"
-                SI=$(( (SI+1) % 10 )); sleep 1
+                sleep 1
             done
 
             wait "$VID_PID"; VEC=$?
@@ -655,7 +752,7 @@ record_window() {
             rm -f "$SLOG" "$CCLOG"
             forget_temp_file "$SLOG"
             forget_temp_file "$CCLOG"
-            echo ""
+            [ "$QUIET" -eq 0 ] && echo ""
 
             if [ "$VEC" -eq 0 ] && [ -f "$SEG_FILE" ]; then
                 break
