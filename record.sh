@@ -37,10 +37,11 @@ BG_C='\033[46;30m'; BG_G='\033[42;30m'; BG_R='\033[41;37m'; BG_Y='\033[43;30m'
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
 draw_bar() {
-    local pct=$1 w=${2:-30}
+    local pct="$1" w="${2:-30}"
     local f=$((pct * w / 100)) e=$((w - f))
-    printf '█%.0s' $(seq 1 $f 2>/dev/null)
-    printf '░%.0s' $(seq 1 $e 2>/dev/null)
+    local i
+    for (( i=0; i<f; i++ )); do printf '█'; done
+    for (( i=0; i<e; i++ )); do printf '░'; done
 }
 
 human_size() {
@@ -50,6 +51,46 @@ for u in ['B','KB','MB','GB']:
     if b<1024: print(f'{b:.1f} {u}'); break
     b/=1024
 "
+}
+
+file_size_bytes() {
+    [ -f "$1" ] || return 1
+    wc -c < "$1" | tr -d ' '
+}
+
+now_seconds_of_day() {
+    local hour minute second
+    hour=$(date +%H)
+    minute=$(date +%M)
+    second=$(date +%S)
+    printf '%s\n' "$((10#$hour * 3600 + 10#$minute * 60 + 10#$second))"
+}
+
+make_temp_file() {
+    mktemp "${TMPDIR:-/tmp}/$1.XXXXXX"
+}
+
+open_output_dir() {
+    local out_dir="$1"
+    local os_name
+
+    os_name=$(uname -s 2>/dev/null || echo "")
+    case "$os_name" in
+        Darwin)
+            if command -v open &>/dev/null; then
+                open "$out_dir"
+                echo -e "  ${G}📂 Opened in Finder${NC}"
+            fi
+            ;;
+        Linux)
+            if command -v xdg-open &>/dev/null && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+                xdg-open "$out_dir" >/dev/null 2>&1 &
+                echo -e "  ${G}📂 Opened output folder${NC}"
+            else
+                echo -e "  ${D}Output folder not opened automatically in this environment${NC}"
+            fi
+            ;;
+    esac
 }
 
 track_temp_file() {
@@ -177,8 +218,8 @@ case "$MODE_CHOICE" in
         if [ "$CUSTOM_MINS" -lt 1 ] || [ "$CUSTOM_MINS" -gt "$MAX_DURATION_MIN" ]; then
             echo -e "  ${R}✗ Duration must be between 1 and ${MAX_DURATION_MIN} minutes${NC}"; exit 1
         fi
-        NH=$(date +%H); NM=$(date +%M)
-        NOW_SEC=$((10#$NH*3600 + 10#$NM*60))
+        NOW_SEC=$(now_seconds_of_day)
+        NOW_SEC=$((NOW_SEC - (NOW_SEC % 60)))
         END_SEC=$((NOW_SEC + CUSTOM_MINS*60))
         if [ "$END_SEC" -gt 86400 ]; then
             echo -e "  ${R}✗ Record-now duration cannot cross midnight${NC}"; exit 1
@@ -413,7 +454,7 @@ echo -e "${BG_C} PHASE 1 ${NC}  ${B}Quality Test (${TEST_SEC}s)${NC}"
 echo ""
 
 TEST_FILE="${OUT_DIR}/_test.mp4"
-TLOG=$(mktemp /tmp/fftest.XXXXXX)
+TLOG=$(make_temp_file fftest)
 track_temp_file "$TEST_FILE"
 track_temp_file "$TLOG"
 
@@ -429,8 +470,12 @@ while kill -0 "$TPID" 2>/dev/null; do
     E=$(( $(date +%s) - TS ))
     R=$((TEST_SEC - E)); [ "$R" -lt 0 ] && R=0
     PCT=$((E * 100 / TEST_SEC)); [ "$PCT" -gt 100 ] && PCT=100
-    [ -f "$TEST_FILE" ] && SZ=$(du -sh "$TEST_FILE" 2>/dev/null | cut -f1) || SZ="..."
-    BAR=$(draw_bar $PCT 25)
+    if TEST_BYTES=$(file_size_bytes "$TEST_FILE" 2>/dev/null); then
+        SZ=$(human_size "$TEST_BYTES")
+    else
+        SZ="..."
+    fi
+    BAR=$(draw_bar "$PCT" 25)
     printf "\r  ${G}${SPIN[$SI]}${NC} TEST [${G}${BAR}${NC}] %3d%%  ${C}%02ds${NC}/${TEST_SEC}s  ${B}%s${NC}   " "$PCT" "$E" "$SZ"
     SI=$(( (SI+1) % 10 )); sleep 1
 done
@@ -511,8 +556,7 @@ record_window() {
 
     # ── Wait for this window's start ──
     while true; do
-        NH=$(date +%-H); NM=$(date +%-M); NS=$(date +%-S)
-        NOW=$((NH*3600 + NM*60 + NS))
+        NOW=$(now_seconds_of_day)
         [ "$NOW" -ge "$WIN_START_SEC" ] && break
         W=$((WIN_START_SEC - NOW))
         printf "\r  ${Y}⏳ Recording at %02d:%02d — %02d:%02d remaining ...${NC}   " \
@@ -531,8 +575,7 @@ record_window() {
 
         # For the last segment, cap duration to not overshoot the window
         local REMAINING_SEC
-        NH=$(date +%-H); NM=$(date +%-M); NS=$(date +%-S)
-        NOW=$((NH*3600 + NM*60 + NS))
+        NOW=$(now_seconds_of_day)
         REMAINING_SEC=$((WIN_END_SEC - NOW))
         local THIS_SEG_SEC=$SEGMENT_SEC
         if [ "$REMAINING_SEC" -lt "$SEGMENT_SEC" ] && [ "$REMAINING_SEC" -gt 0 ]; then
@@ -557,7 +600,7 @@ record_window() {
             [ "$ATTEMPT" -gt 1 ] && rm -f "$SEG_FILE" "$SRT_FILE"
 
             SEG_TS=$(date +%s)
-            SLOG=$(mktemp /tmp/ffseg.XXXXXX)
+            SLOG=$(make_temp_file ffseg)
             track_temp_file "$SLOG"
 
             # Main video
@@ -569,7 +612,7 @@ record_window() {
             track_pid "$VID_PID"
 
             # CC extraction
-            CCLOG=$(mktemp /tmp/ffcc.XXXXXX)
+            CCLOG=$(make_temp_file ffcc)
             track_temp_file "$CCLOG"
             ffmpeg -y -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
                 -map 0:s:0? -c:s srt -loglevel error \
@@ -586,10 +629,14 @@ record_window() {
                 GPCT=$(( ((i-1)*SEGMENT_SEC + E) * 100 / TOTAL_SEC ))
                 [ "$GPCT" -gt 100 ] && GPCT=100
 
-                [ -f "$SEG_FILE" ] && SZ=$(du -sh "$SEG_FILE" 2>/dev/null | cut -f1) || SZ="..."
+                if SEG_BYTES=$(file_size_bytes "$SEG_FILE" 2>/dev/null); then
+                    SZ=$(human_size "$SEG_BYTES")
+                else
+                    SZ="..."
+                fi
 
-                BAR=$(draw_bar $PCT 25)
-                GBAR=$(draw_bar $GPCT 20)
+                BAR=$(draw_bar "$PCT" 25)
+                GBAR=$(draw_bar "$GPCT" 20)
 
                 printf "\r  ${G}${SPIN[$SI]}${NC} seg [${G}${BAR}${NC}] %3d%%  ${C}%d:%02d${NC}  ${B}%s${NC}  │  win [${Y}${GBAR}${NC}] %3d%%  " \
                     "$PCT" "$((E/60))" "$((E%60))" "$SZ" "$GPCT"
@@ -684,10 +731,4 @@ echo -e "  ${B}Files:${NC}"
 ls -lh "$OUT_DIR"/ | tail -n +2 | while read line; do echo "    $line"; done
 echo ""
 
-if command -v open &>/dev/null; then
-    open "$OUT_DIR"
-    echo -e "  ${G}📂 Opened in Finder${NC}"
-elif command -v xdg-open &>/dev/null; then
-    xdg-open "$OUT_DIR" >/dev/null 2>&1 &
-    echo -e "  ${G}📂 Opened output folder${NC}"
-fi
+open_output_dir "$OUT_DIR"
