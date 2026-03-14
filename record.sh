@@ -18,6 +18,8 @@ QUIET=0
 SEGMENT_SEC=300  # 5 minutes
 TEST_SEC=15
 MAX_DURATION_MIN=1440
+SEGMENT_TIMEOUT_MULTIPLIER=2
+SLOW_SEGMENT_GRACE_SEC=15
 
 declare -a TEMP_FILES=()
 declare -a ACTIVE_PIDS=()
@@ -94,6 +96,31 @@ open_output_dir() {
             fi
             ;;
     esac
+}
+
+start_timeout_watchdog() {
+    local target_pid="$1"
+    local timeout_sec="$2"
+    local marker_file="$3"
+
+    (
+        sleep "$timeout_sec"
+        if kill -0 "$target_pid" 2>/dev/null; then
+            printf 'timeout\n' > "$marker_file"
+            kill "$target_pid" 2>/dev/null || true
+            sleep 5
+            kill -KILL "$target_pid" 2>/dev/null || true
+        fi
+    ) &
+    printf '%s\n' "$!"
+}
+
+stop_timeout_watchdog() {
+    local watchdog_pid="$1"
+    [ -n "$watchdog_pid" ] || return 0
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    forget_pid "$watchdog_pid"
 }
 
 track_temp_file() {
@@ -704,6 +731,10 @@ record_window() {
                 "$SEG_FILE" 2>"$SLOG" &
             VID_PID=$!
             track_pid "$VID_PID"
+            STALL_MARKER=$(make_temp_file ffstall)
+            track_temp_file "$STALL_MARKER"
+            WATCHDOG_PID=$(start_timeout_watchdog "$VID_PID" "$((THIS_SEG_SEC * SEGMENT_TIMEOUT_MULTIPLIER))" "$STALL_MARKER")
+            track_pid "$WATCHDOG_PID"
 
             # CC extraction
             CCLOG=$(make_temp_file ffcc)
@@ -742,6 +773,8 @@ record_window() {
 
             wait "$VID_PID"; VEC=$?
             forget_pid "$VID_PID"
+            ATTEMPT_ELAPSED=$(( $(date +%s) - SEG_TS ))
+            stop_timeout_watchdog "$WATCHDOG_PID"
 
             # Kill CC if stuck
             ( sleep 8; kill "$CC_PID" 2>/dev/null ) &
@@ -752,6 +785,13 @@ record_window() {
             rm -f "$SLOG" "$CCLOG"
             forget_temp_file "$SLOG"
             forget_temp_file "$CCLOG"
+            if [ -s "$STALL_MARKER" ]; then
+                echo -e "    ${Y}⚠ Segment stalled and hit the ${SEGMENT_TIMEOUT_MULTIPLIER}x timeout (${THIS_SEG_SEC}s → $((THIS_SEG_SEC * SEGMENT_TIMEOUT_MULTIPLIER))s)${NC}"
+            elif [ "$ATTEMPT_ELAPSED" -gt $((THIS_SEG_SEC + SLOW_SEGMENT_GRACE_SEC)) ]; then
+                echo -e "    ${Y}⚠ Segment ran ${ATTEMPT_ELAPSED}s for a ${THIS_SEG_SEC}s target${NC}"
+            fi
+            rm -f "$STALL_MARKER"
+            forget_temp_file "$STALL_MARKER"
             [ "$QUIET" -eq 0 ] && echo ""
 
             if [ "$VEC" -eq 0 ] && [ -f "$SEG_FILE" ]; then
