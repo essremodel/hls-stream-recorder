@@ -15,6 +15,10 @@ OUT_DIR="${SCRIPT_DIR}/recording_$(date +%Y%m%d)"
 SEGMENT_SEC=300  # 5 minutes
 TEST_SEC=15
 
+declare -a TEMP_FILES=()
+declare -a ACTIVE_PIDS=()
+CLEANUP_DONE=0
+
 # ── Scheduled recording windows (24h format) ──
 # Window 1: 5:55 PM → 7:00 PM  (5 min early cushion)
 # Window 2: 9:55 PM → 11:00 PM (5 min early cushion)
@@ -46,6 +50,63 @@ for u in ['B','KB','MB','GB']:
     b/=1024
 "
 }
+
+track_temp_file() {
+    TEMP_FILES+=("$1")
+}
+
+forget_temp_file() {
+    local target="$1"
+    local kept=()
+    local path
+    for path in "${TEMP_FILES[@]}"; do
+        [ "$path" != "$target" ] && kept+=("$path")
+    done
+    TEMP_FILES=("${kept[@]}")
+}
+
+track_pid() {
+    ACTIVE_PIDS+=("$1")
+}
+
+forget_pid() {
+    local target="$1"
+    local kept=()
+    local pid
+    for pid in "${ACTIVE_PIDS[@]}"; do
+        [ "$pid" != "$target" ] && kept+=("$pid")
+    done
+    ACTIVE_PIDS=("${kept[@]}")
+}
+
+cleanup() {
+    local exit_code="${1:-$?}"
+    local pid
+    local path
+
+    if [ "$CLEANUP_DONE" -eq 1 ]; then
+        return "$exit_code"
+    fi
+    CLEANUP_DONE=1
+
+    for pid in "${ACTIVE_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    for pid in "${ACTIVE_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    for path in "${TEMP_FILES[@]}"; do
+        rm -f "$path"
+    done
+
+    return "$exit_code"
+}
+
+trap 'cleanup $?' EXIT
+trap 'cleanup 130; exit 130' INT
+trap 'cleanup 143; exit 143' TERM
 
 # ══════════════════════════════════════════════════════════
 # MODE SELECTION
@@ -323,12 +384,15 @@ echo ""
 
 TEST_FILE="${OUT_DIR}/_test.mp4"
 TLOG=$(mktemp /tmp/fftest.XXXXXX)
+track_temp_file "$TEST_FILE"
+track_temp_file "$TLOG"
 
 ffmpeg -y -i "$BEST_URL" -t "$TEST_SEC" \
     -c copy -movflags +faststart \
     -loglevel warning -stats \
     "$TEST_FILE" 2>"$TLOG" &
 TPID=$!
+track_pid "$TPID"
 SI=0; TS=$(date +%s)
 
 while kill -0 "$TPID" 2>/dev/null; do
@@ -342,7 +406,9 @@ while kill -0 "$TPID" 2>/dev/null; do
 done
 
 wait "$TPID"; TEC=$?
+forget_pid "$TPID"
 rm -f "$TLOG"
+forget_temp_file "$TLOG"
 echo ""
 
 if [ "$TEC" -eq 0 ] && [ -f "$TEST_FILE" ]; then
@@ -369,14 +435,17 @@ if [ "$TEC" -eq 0 ] && [ -f "$TEST_FILE" ]; then
         fi
 
         rm -f "$TEST_FILE"
+        forget_temp_file "$TEST_FILE"
     else
         echo -e "  ${R}${B}✗ TEST FAILED${NC} — file too small (${TB} bytes)"
         rm -f "$TEST_FILE"
+        forget_temp_file "$TEST_FILE"
         exit 1
     fi
 else
     echo -e "  ${R}${B}✗ TEST FAILED${NC} — ffmpeg exit code $TEC"
     rm -f "$TEST_FILE"
+    forget_temp_file "$TEST_FILE"
     exit 1
 fi
 
@@ -452,6 +521,7 @@ record_window() {
         echo -e "  ${BG_C} SEG $i/$NUM_SEGMENTS ${NC}  ${SEG_CLOCK}  →  segment_$(printf '%03d' $GLOBAL_SEG_NUM).mp4  (${THIS_SEG_SEC}s)"
 
         SLOG=$(mktemp /tmp/ffseg.XXXXXX)
+        track_temp_file "$SLOG"
 
         # Main video
         ffmpeg -y -i "$BEST_URL" -t "$THIS_SEG_SEC" \
@@ -459,13 +529,16 @@ record_window() {
             -movflags +faststart -loglevel warning -stats \
             "$SEG_FILE" 2>"$SLOG" &
         VID_PID=$!
+        track_pid "$VID_PID"
 
         # CC extraction
         CCLOG=$(mktemp /tmp/ffcc.XXXXXX)
+        track_temp_file "$CCLOG"
         ffmpeg -y -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
             -map 0:s:0? -c:s srt -loglevel error \
             "$SRT_FILE" 2>"$CCLOG" &
         CC_PID=$!
+        track_pid "$CC_PID"
 
         SI=0
         while kill -0 "$VID_PID" 2>/dev/null; do
@@ -487,13 +560,17 @@ record_window() {
         done
 
         wait "$VID_PID"; VEC=$?
+        forget_pid "$VID_PID"
 
         # Kill CC if stuck
         ( sleep 8; kill "$CC_PID" 2>/dev/null ) &
         KP=$!; wait "$CC_PID" 2>/dev/null
+        forget_pid "$CC_PID"
         kill "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
 
         rm -f "$SLOG" "$CCLOG"
+        forget_temp_file "$SLOG"
+        forget_temp_file "$CCLOG"
         echo ""
 
         # Video result + resolution verification
