@@ -515,63 +515,77 @@ record_window() {
 
         SEG_FILE="${OUT_DIR}/segment_$(printf '%03d' $GLOBAL_SEG_NUM).mp4"
         SRT_FILE="${OUT_DIR}/segment_$(printf '%03d' $GLOBAL_SEG_NUM).srt"
-        SEG_TS=$(date +%s)
         SEG_CLOCK=$(date +%H:%M:%S)
 
         echo -e "  ${BG_C} SEG $i/$NUM_SEGMENTS ${NC}  ${SEG_CLOCK}  →  segment_$(printf '%03d' $GLOBAL_SEG_NUM).mp4  (${THIS_SEG_SEC}s)"
 
-        SLOG=$(mktemp /tmp/ffseg.XXXXXX)
-        track_temp_file "$SLOG"
+        ATTEMPT=1
+        VEC=1
+        while [ "$ATTEMPT" -le 2 ]; do
+            [ "$ATTEMPT" -gt 1 ] && echo -e "    ${Y}↻ Retry ${ATTEMPT}/2 in 5s after segment failure${NC}"
+            [ "$ATTEMPT" -gt 1 ] && sleep 5
+            [ "$ATTEMPT" -gt 1 ] && rm -f "$SEG_FILE" "$SRT_FILE"
 
-        # Main video
-        ffmpeg -y -i "$BEST_URL" -t "$THIS_SEG_SEC" \
-            -c:v copy -c:a copy \
-            -movflags +faststart -loglevel warning -stats \
-            "$SEG_FILE" 2>"$SLOG" &
-        VID_PID=$!
-        track_pid "$VID_PID"
+            SEG_TS=$(date +%s)
+            SLOG=$(mktemp /tmp/ffseg.XXXXXX)
+            track_temp_file "$SLOG"
 
-        # CC extraction
-        CCLOG=$(mktemp /tmp/ffcc.XXXXXX)
-        track_temp_file "$CCLOG"
-        ffmpeg -y -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
-            -map 0:s:0? -c:s srt -loglevel error \
-            "$SRT_FILE" 2>"$CCLOG" &
-        CC_PID=$!
-        track_pid "$CC_PID"
+            # Main video
+            ffmpeg -y -i "$BEST_URL" -t "$THIS_SEG_SEC" \
+                -c:v copy -c:a copy \
+                -movflags +faststart -loglevel warning -stats \
+                "$SEG_FILE" 2>"$SLOG" &
+            VID_PID=$!
+            track_pid "$VID_PID"
 
-        SI=0
-        while kill -0 "$VID_PID" 2>/dev/null; do
-            E=$(( $(date +%s) - SEG_TS ))
-            R=$((THIS_SEG_SEC - E)); [ "$R" -lt 0 ] && R=0
-            PCT=$((E * 100 / THIS_SEG_SEC)); [ "$PCT" -gt 100 ] && PCT=100
+            # CC extraction
+            CCLOG=$(mktemp /tmp/ffcc.XXXXXX)
+            track_temp_file "$CCLOG"
+            ffmpeg -y -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
+                -map 0:s:0? -c:s srt -loglevel error \
+                "$SRT_FILE" 2>"$CCLOG" &
+            CC_PID=$!
+            track_pid "$CC_PID"
 
-            GPCT=$(( ((i-1)*SEGMENT_SEC + E) * 100 / TOTAL_SEC ))
-            [ "$GPCT" -gt 100 ] && GPCT=100
+            SI=0
+            while kill -0 "$VID_PID" 2>/dev/null; do
+                E=$(( $(date +%s) - SEG_TS ))
+                R=$((THIS_SEG_SEC - E)); [ "$R" -lt 0 ] && R=0
+                PCT=$((E * 100 / THIS_SEG_SEC)); [ "$PCT" -gt 100 ] && PCT=100
 
-            [ -f "$SEG_FILE" ] && SZ=$(du -sh "$SEG_FILE" 2>/dev/null | cut -f1) || SZ="..."
+                GPCT=$(( ((i-1)*SEGMENT_SEC + E) * 100 / TOTAL_SEC ))
+                [ "$GPCT" -gt 100 ] && GPCT=100
 
-            BAR=$(draw_bar $PCT 25)
-            GBAR=$(draw_bar $GPCT 20)
+                [ -f "$SEG_FILE" ] && SZ=$(du -sh "$SEG_FILE" 2>/dev/null | cut -f1) || SZ="..."
 
-            printf "\r  ${G}${SPIN[$SI]}${NC} seg [${G}${BAR}${NC}] %3d%%  ${C}%d:%02d${NC}  ${B}%s${NC}  │  win [${Y}${GBAR}${NC}] %3d%%  " \
-                "$PCT" "$((E/60))" "$((E%60))" "$SZ" "$GPCT"
-            SI=$(( (SI+1) % 10 )); sleep 1
+                BAR=$(draw_bar $PCT 25)
+                GBAR=$(draw_bar $GPCT 20)
+
+                printf "\r  ${G}${SPIN[$SI]}${NC} seg [${G}${BAR}${NC}] %3d%%  ${C}%d:%02d${NC}  ${B}%s${NC}  │  win [${Y}${GBAR}${NC}] %3d%%  " \
+                    "$PCT" "$((E/60))" "$((E%60))" "$SZ" "$GPCT"
+                SI=$(( (SI+1) % 10 )); sleep 1
+            done
+
+            wait "$VID_PID"; VEC=$?
+            forget_pid "$VID_PID"
+
+            # Kill CC if stuck
+            ( sleep 8; kill "$CC_PID" 2>/dev/null ) &
+            KP=$!; wait "$CC_PID" 2>/dev/null
+            forget_pid "$CC_PID"
+            kill "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
+
+            rm -f "$SLOG" "$CCLOG"
+            forget_temp_file "$SLOG"
+            forget_temp_file "$CCLOG"
+            echo ""
+
+            if [ "$VEC" -eq 0 ] && [ -f "$SEG_FILE" ]; then
+                break
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
         done
-
-        wait "$VID_PID"; VEC=$?
-        forget_pid "$VID_PID"
-
-        # Kill CC if stuck
-        ( sleep 8; kill "$CC_PID" 2>/dev/null ) &
-        KP=$!; wait "$CC_PID" 2>/dev/null
-        forget_pid "$CC_PID"
-        kill "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
-
-        rm -f "$SLOG" "$CCLOG"
-        forget_temp_file "$SLOG"
-        forget_temp_file "$CCLOG"
-        echo ""
 
         # Video result + resolution verification
         if [ "$VEC" -eq 0 ] && [ -f "$SEG_FILE" ]; then
