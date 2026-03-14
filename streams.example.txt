@@ -1,0 +1,7 @@
+# ─── My Custom Streams ───────────────────────────
+# FORMAT: category|short_name|display_name|url|notes
+# Copy this file to streams.txt and add your own streams there.
+# streams.txt is gitignored so your private URLs stay local.
+#
+# Example:
+# My Streams|office-cam|Office Security Cam|http://192.168.1.50:8080/stream.m3u8|Local network only

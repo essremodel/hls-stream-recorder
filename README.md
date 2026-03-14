@@ -8,19 +8,24 @@ A bash script that records HLS live streams at the highest available bitrate. Au
 
 ## Features
 
+- **Built-in channel guide** — curated free public HLS streams grouped by category in `channels.conf`
+- **Custom streams** — add personal or private HLS endpoints in `streams.txt` without committing them
+- **Interactive stream picker** — choose by menu number, short name, or manual URL before recording mode selection
+- **Parallel stream health checks** — test the full catalog with `t` in the picker or `--test-streams`
 - **Auto-selects highest quality** — parses the master `.m3u8` and picks the top bitrate/resolution variant
 - **Pre-flight quality test** — records a 15-second sample and verifies resolution before committing
-- **Three recording modes:**
+- **Four recording modes:**
   - **Scheduled** — two preset time windows with 5-minute early cushion
   - **Record Now (duration)** — start immediately for N minutes
   - **Record Now (time range)** — specify custom start/end times (12h or 24h format)
+  - **Keyword monitor** — rolling retention on caption keyword hits
 - **Keyword monitor (experimental)** — rolling 2.5-minute segments with keyword-triggered retention
 - **5-minute segments** — fault-tolerant chunking so a stream hiccup doesn't lose everything
 - **Automatic retry** — retries a failed segment once after a short pause
 - **Stall protection** — kills a segment attempt that runs for more than 2x its target duration
 - **Closed captions** — attempts `.srt` extraction per segment
 - **Live progress UI** — animated spinners, progress bars, file sizes, per-segment and overall progress
-- **CLI flags** — supports `--help`, `--quiet`, `--url`, and `--output`
+- **CLI flags** — supports `--stream`, `--test-streams`, `--mode`, `--url`, `--output`, and monitor options
 - **Detailed stream probe** — displays codec, resolution, FPS, color space, bitrate before recording
 
 ## Requirements
@@ -36,10 +41,10 @@ A bash script that records HLS live streams at the highest available bitrate. Au
 
 ```bash
 chmod +x record.sh
-./record.sh --url https://your-stream.com/index.m3u8
+./record.sh
 ```
 
-Pass the HLS master playlist URL either as the first argument or with `--url`. If you prefer, you can edit the default `MASTER_URL` placeholder near the top of `record.sh` instead.
+Run with no arguments to open the built-in stream picker. You can also skip the picker with `--stream` or bypass the catalog entirely with `--url` or a positional URL.
 
 ### CLI Flags
 
@@ -47,6 +52,10 @@ Pass the HLS master playlist URL either as the first argument or with `--url`. I
 |------|-------------|
 | `-h`, `--help` | Show usage and exit |
 | `-q`, `--quiet` | Suppress progress animations and countdown redraws |
+| `--stream <ref>` | Select a stream by menu number or short name, such as `1` or `cbs4` |
+| `--test-streams` | Probe every configured stream and report which ones are live |
+| `--update-channels` | Placeholder for future guide sync; currently prints a stub message and exits |
+| `--mode <mode>` | Skip the mode prompt with `1-4`, `scheduled`, `duration`, `range`, or `monitor` |
 | `--monitor` | Enable keyword monitor mode (experimental) |
 | `--keywords <file>` | Use a custom keywords file for monitor mode |
 | `--until <time>` | Stop monitor mode at a specific time |
@@ -57,13 +66,48 @@ Pass the HLS master playlist URL either as the first argument or with `--url`. I
 ### Examples
 
 ```bash
-./record.sh https://your-stream.com/index.m3u8
+./record.sh
+./record.sh --stream cbs4
+./record.sh --stream 1 --mode 2
+./record.sh --stream abc --monitor
+./record.sh --test-streams
 ./record.sh --url https://your-stream.com/index.m3u8 --output /tmp/hls-capture
-echo 1 | ./record.sh --quiet https://your-stream.com/index.m3u8
+./record.sh https://your-stream.com/index.m3u8
+echo 1 | ./record.sh --quiet --stream cbs4
 ./record.sh --monitor --keywords ./keywords.txt --until 23:00
 ```
 
-On launch you'll see a mode selection menu:
+## Stream Selection
+
+The recorder ships with a built-in guide of free public HLS channels in `channels.conf`. The first entry is the default stream.
+
+For private or personal URLs, edit `streams.txt`. A committed template lives in `streams.example.txt`, and `streams.txt` is gitignored so your private endpoints stay local.
+
+Both files use the same pipe-delimited format:
+
+```text
+category|short_name|display_name|url|notes
+```
+
+If you do not pass `--stream` or `--url`, the script shows a stream picker before the recording mode menu. You can:
+
+- Press `Enter` to use the default built-in stream
+- Type a menu number such as `1`
+- Type a short name such as `cbs4`, `abc`, or `cspan1`
+- Type `u` to enter a raw HLS URL manually
+- Type `t` to run a live check across the whole catalog
+
+Manual URLs, built-in channels, and custom streams are quick-probed before the mode menu. If a stream is offline, the picker offers retry, alternate-stream, back, and manual-URL options.
+
+### Test All Streams
+
+```bash
+./record.sh --test-streams
+```
+
+This runs up to 5 probes in parallel, caches results for the current session, and reports online/offline status with resolution and bitrate when available.
+
+After stream selection you'll see the recording mode menu:
 
 ```
   Choose recording mode:
@@ -113,6 +157,26 @@ End time: 4:00pm
 | `9am` | 9:00 AM |
 | `21:00` | 9:00 PM |
 
+## Adding Channels
+
+Edit `channels.conf` to add or remove built-in guide entries:
+
+```text
+Category|short_name|Display Name|https://url/master.m3u8|Optional notes
+```
+
+Use `streams.txt` for personal streams instead of editing `channels.conf`.
+
+If a stream needs a custom User-Agent, add it in the notes field:
+
+```text
+My Streams|strict-feed|Strict Feed|https://example.com/live.m3u8|user-agent=Mozilla/5.0 Custom Client; Requires desktop UA
+```
+
+## Channel Sources
+
+Built-in channels are sourced from publicly available free streams. Many originate from [iptv-org/iptv](https://github.com/iptv-org/iptv) and similar open directories. URLs may change or disappear over time, so use `t` in the picker or `--test-streams` to verify availability.
+
 ## Keyword Monitor Mode (Experimental)
 
 Keyword monitor mode records continuously into a rolling on-disk buffer, extracts captions per segment when possible, and keeps only the segments around a keyword hit. By default it keeps roughly 5 minutes before and 5 minutes after a match, using 150-second segments.
@@ -127,13 +191,13 @@ Keyword monitor mode records continuously into a rolling on-disk buffer, extract
 ```
 
 - `--monitor` switches directly into mode 4.
-- `--keywords` overrides the default [`keywords.txt`](/Users/tylerhall/Documents/GitHub-ESS/recorder/keywords.txt).
+- `--keywords` overrides the default `keywords.txt`.
 - `--until` stops monitor mode at the specified local time.
 - `--segment-length` changes the rolling segment size in seconds.
 
 ### `keywords.txt` Format
 
-The default keyword file is [`keywords.txt`](/Users/tylerhall/Documents/GitHub-ESS/recorder/keywords.txt). Put one keyword or phrase per line. Matching is case-insensitive substring matching, so `ESS` matches `...team from ESS responded...` and `Top Edge` matches longer caption lines containing that phrase.
+The default keyword file is `keywords.txt`. Put one keyword or phrase per line. Matching is case-insensitive substring matching, so `ESS` matches `...team from ESS responded...` and `Top Edge` matches longer caption lines containing that phrase.
 
 ### Monitor Output Layout
 
@@ -173,16 +237,13 @@ chmod +x debug_cc.sh
 ./debug_cc.sh https://your-stream.com/index.m3u8
 ```
 
-[`debug_cc.sh`](/Users/tylerhall/Documents/GitHub-ESS/recorder/debug_cc.sh) inspects the manifest, reports subtitle/CC metadata, and tests the caption extraction paths used by the recorder. If every method reports empty output, monitor mode will still record and rotate segments, but keyword-triggered retention will not fire.
+`debug_cc.sh` inspects the manifest, reports subtitle/CC metadata, and tests the caption extraction paths used by the recorder. If every method reports empty output, monitor mode will still record and rotate segments, but keyword-triggered retention will not fire.
 
 ## Configuration
 
 Edit the variables at the top of the script to customize:
 
 ```bash
-# Stream URL from the first CLI argument, with a placeholder default
-MASTER_URL="${1:-https://example.com/stream/index.m3u8}"
-
 # Segment length (seconds)
 SEGMENT_SEC=300  # 5 minutes
 
@@ -194,7 +255,7 @@ WIN2_START_HOUR=21; WIN2_START_MIN=55   # 9:55 PM
 WIN2_END_HOUR=23;   WIN2_END_MIN=0      # 11:00 PM
 ```
 
-You can also override the output folder at runtime with `--output /path/to/folder`.
+The built-in channel guide lives in `channels.conf`, and personal streams live in `streams.txt`. You can also override the output folder at runtime with `--output /path/to/folder`.
 
 If a provider is strict about request headers, you can override the default HTTP User-Agent:
 
@@ -272,7 +333,7 @@ If a segment needs intervention, you may also see lines like:
 
 - **Segment duration** — 5 minutes is a good balance between fault tolerance and file count. Increase `SEGMENT_SEC` for fewer, larger files.
 - **Adding more windows** — add `WIN3_*` variables and append them to the arrays in the scheduled-mode case block.
-- **Cron/launchd** — to run unattended, pipe `1` into stdin: `echo 1 | ./record.sh --quiet https://your-stream.com/index.m3u8` and it will use scheduled mode with no interaction.
+- **Cron/launchd** — to run unattended, pass both `--stream` and `--mode`, for example `./record.sh --quiet --stream cbs4 --mode 1`.
 - **Monitor mode** — for long runs, point `--output` at a disk with plenty of free space and keep `monitor.log` under review for CC warnings.
 - **Disk space** — a 1080p HLS stream typically runs 3–6 GB/hour depending on bitrate. Plan accordingly for multi-hour recordings.
 
@@ -294,7 +355,7 @@ If a segment needs intervention, you may also see lines like:
 
 ### Monitor mode finds no keywords even though the stream should have captions
 
-- Run [`debug_cc.sh`](/Users/tylerhall/Documents/GitHub-ESS/recorder/debug_cc.sh) against the same master playlist URL first.
+- Run `./debug_cc.sh` against the same master playlist URL first.
 - If the diagnostic reports `TYPE=CLOSED-CAPTIONS` but every extraction method is empty, ffmpeg is not decoding usable text from that stream in the current environment.
 - Monitor mode will still rotate segments in `buffer/`, but it will warn that keyword retention is effectively disabled.
 

@@ -6,6 +6,8 @@ kept/
 *.srt
 *.txt
 !keywords.txt
+!streams.example.txt
 _test.mp4
 monitor.log
+streams.txt
 .DS_Store

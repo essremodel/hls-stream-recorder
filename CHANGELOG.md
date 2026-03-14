@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Built-in stream catalog files: `channels.conf`, `channels.sh`, `streams.example.txt`, and a gitignored `streams.txt` template for personal channels.
+- Interactive stream picker with category-grouped menus, default selection, short-name lookup, manual URL entry, and offline alternate suggestions.
+- New CLI shortcuts: `--stream`, `--mode`, `--test-streams`, and `--update-channels` (stub).
+- Session-cached stream health checks with capped parallel probing and per-stream resolution/bitrate summaries.
 - Experimental keyword monitor mode with rolling-buffer retention, per-segment caption scanning, and keyword-triggered kept folders.
 - `debug_cc.sh` to inspect manifest tracks and test multiple caption extraction methods before enabling monitor mode on a stream.
 - `keywords.txt` with default ESS/CHD-related phrases for monitor mode.
@@ -19,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Stream selection now happens before recording mode selection, while keeping direct `--url` and positional URL input working.
+- Per-stream notes can now carry optional `user-agent=` metadata that is reused across `curl`, `ffprobe`, and `ffmpeg` requests.
 - Hardened duration and time parsing, including support for inputs like `12am`, `12pm`, and bare-hour values such as `2pm`.
 - Added validation to reject invalid durations, malformed times, and record-now durations that would cross midnight.
 - Replaced several platform-specific shell idioms with more portable helpers for progress bars, temp files, current time, and output-folder opening.

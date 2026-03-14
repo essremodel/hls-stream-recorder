@@ -9,14 +9,36 @@
 # ─────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-DEFAULT_MASTER_URL="https://example.com/stream/index.m3u8"
 HTTP_USER_AGENT="${HLS_RECORDER_USER_AGENT:-Mozilla/5.0 (HLS Stream Recorder)}"
+ACTIVE_HTTP_USER_AGENT="$HTTP_USER_AGENT"
+CHANNELS_CONF_FILE="${SCRIPT_DIR}/channels.conf"
+STREAMS_FILE="${SCRIPT_DIR}/streams.txt"
+CHANNELS_HELPER_FILE="${SCRIPT_DIR}/channels.sh"
 MASTER_URL=""
 OUT_DIR=""
 OUTPUT_OVERRIDE=""
 DEFAULT_OUTPUT_DIR="${SCRIPT_DIR}/recording_$(date +%Y%m%d)"
 DEFAULT_MONITOR_OUTPUT_DIR="${SCRIPT_DIR}/recording_monitor_$(date +%Y%m%d)"
 QUIET=0
+STREAM_SELECTOR=""
+STREAM_TEST_FLAG=0
+UPDATE_CHANNELS_FLAG=0
+MODE_OVERRIDE=""
+SELECTED_NAME=""
+SELECTED_SHORT=""
+SELECTED_CATEGORY=""
+SELECTED_NOTES=""
+SELECTED_SOURCE=""
+SELECTED_PROBE_SUMMARY=""
+SELECTED_STREAM_USER_AGENT=""
+SELECTED_CATALOG_INDEX=""
+STREAM_SELECTION_VALIDATED=0
+STREAM_PROBE_TIMEOUT_SEC=5
+STREAM_TEST_TIMEOUT_SEC=8
+STREAM_TEST_TOTAL_TIMEOUT_SEC=20
+STREAM_TEST_MAX_PARALLEL=5
+BASE_DEPS_READY=0
+CATALOG_LOADED=0
 
 SEGMENT_SEC=300  # 5 minutes
 TEST_SEC=15
@@ -48,9 +70,21 @@ MONITOR_STREAM_SUMMARY=""
 MONITOR_HAS_CC_DECLARED=0
 MONITOR_HAS_SUBTITLE_DECLARED=0
 
+[ -f "$CHANNELS_HELPER_FILE" ] || {
+    echo "Missing channel helper: $CHANNELS_HELPER_FILE" >&2
+    exit 1
+}
+# shellcheck source=./channels.sh
+. "$CHANNELS_HELPER_FILE"
+
 declare -a TEMP_FILES=()
 declare -a ACTIVE_PIDS=()
 CLEANUP_DONE=0
+declare -A STREAM_HEALTH_STATUS=()
+declare -A STREAM_HEALTH_RESOLUTION=()
+declare -A STREAM_HEALTH_BITRATE=()
+declare -A STREAM_HEALTH_ERROR=()
+declare -A STREAM_HEALTH_PROBE_SUMMARY=()
 declare -A MONITOR_FLAGGED_SEGMENTS=()
 declare -A MONITOR_SEG_MP4=()
 declare -A MONITOR_SEG_SRT=()
@@ -310,6 +344,11 @@ Record an HLS stream at the highest available quality.
 Options:
   -h, --help          Show this help text and exit
   -q, --quiet         Suppress progress animations
+      --stream REF    Select a built-in/custom stream by number or short name
+      --test-streams  Probe all configured streams and report which are live
+      --update-channels
+                      Stub for future guide sync; prints a placeholder and exits
+      --mode MODE     Choose recording mode (1-4, scheduled, duration, range, monitor)
       --monitor       Enable keyword monitor mode (experimental)
       --keywords FILE Use FILE for monitor keywords (default: keywords.txt)
       --until TIME    Stop monitor mode at TIME (e.g. 23:00)
@@ -322,11 +361,735 @@ Arguments:
   url                 HLS master playlist URL (same as --url)
 
 Examples:
+  $(basename "$0") --stream cbs4
+  $(basename "$0") --stream 1 --mode 2
+  $(basename "$0") --stream abc --monitor
+  $(basename "$0") --test-streams
   $(basename "$0") https://your-stream.com/index.m3u8
   $(basename "$0") --url https://your-stream.com/index.m3u8 --output /tmp/capture
   echo 1 | $(basename "$0") --quiet https://your-stream.com/index.m3u8
   $(basename "$0") --monitor --keywords ./keywords.txt --until 23:00
 EOF
+}
+
+print_banner() {
+    if [ "$QUIET" -eq 0 ] && [ -t 1 ]; then
+        clear
+    fi
+    echo -e "${C}${B}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${C}${B}║          📡  HLS Stream Recorder  —  MAX QUALITY         ║${NC}"
+    echo -e "${C}${B}╚═══════════════════════════════════════════════════════════╝${NC}"
+}
+
+ensure_catalog_loaded() {
+    if [ "$CATALOG_LOADED" -eq 1 ]; then
+        return 0
+    fi
+    channels_load_catalog "$CHANNELS_CONF_FILE" "$STREAMS_FILE" || return 1
+    CATALOG_LOADED=1
+}
+
+ensure_selection_dependencies() {
+    [ "$BASE_DEPS_READY" -eq 1 ] && return 0
+    command -v ffprobe &>/dev/null || {
+        echo -e "${R}✗ ffprobe not found! → brew install ffmpeg${NC}"
+        exit 1
+    }
+    command -v python3 &>/dev/null || {
+        echo -e "${R}✗ python3 not found!${NC}"
+        exit 1
+    }
+    BASE_DEPS_READY=1
+}
+
+normalize_mode_selector() {
+    local raw
+    raw="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "$raw" in
+        1|scheduled)
+            printf '1\n'
+            ;;
+        2|duration|now)
+            printf '2\n'
+            ;;
+        3|range|time|time-range)
+            printf '3\n'
+            ;;
+        4|monitor)
+            printf '4\n'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+resolve_stream_index() {
+    local selector="$1"
+    local short_key
+
+    [ -n "$selector" ] || return 1
+    short_key="$(channels_short_key "$selector")"
+
+    if [[ "$short_key" =~ ^[0-9]+$ ]]; then
+        local numeric=$((10#$short_key))
+        if [ "$numeric" -ge 1 ] && [ "$numeric" -le "${#CHANNEL_SHORTS[@]}" ]; then
+            printf '%s\n' "$((numeric - 1))"
+            return 0
+        fi
+        return 1
+    fi
+
+    if [ -n "${CHANNEL_INDEX_BY_SHORT[$short_key]:-}" ]; then
+        printf '%s\n' "${CHANNEL_INDEX_BY_SHORT[$short_key]}"
+        return 0
+    fi
+
+    return 1
+}
+
+set_selected_stream_from_index() {
+    local idx="$1"
+    local notes_raw="${CHANNEL_NOTES[$idx]}"
+    local notes_display=""
+    local notes_ua=""
+
+    MASTER_URL="${CHANNEL_URLS[$idx]}"
+    SELECTED_NAME="${CHANNEL_NAMES[$idx]}"
+    SELECTED_SHORT="${CHANNEL_SHORTS[$idx]}"
+    SELECTED_CATEGORY="${CHANNEL_CATEGORIES[$idx]}"
+    SELECTED_SOURCE="${CHANNEL_SOURCES[$idx]}"
+    SELECTED_CATALOG_INDEX="$idx"
+    SELECTED_PROBE_SUMMARY="${STREAM_HEALTH_PROBE_SUMMARY[$idx]:-}"
+    STREAM_SELECTION_VALIDATED=0
+
+    if notes_display=$(channels_notes_display "$notes_raw" 2>/dev/null); then
+        SELECTED_NOTES="$notes_display"
+    else
+        SELECTED_NOTES=""
+    fi
+
+    if notes_ua=$(channels_user_agent_from_notes "$notes_raw" 2>/dev/null); then
+        SELECTED_STREAM_USER_AGENT="$notes_ua"
+    else
+        SELECTED_STREAM_USER_AGENT=""
+    fi
+    ACTIVE_HTTP_USER_AGENT="${SELECTED_STREAM_USER_AGENT:-$HTTP_USER_AGENT}"
+}
+
+set_selected_manual_stream() {
+    local raw_url="$1"
+    local label="${2:-Manual URL}"
+    local source="${3:-manual}"
+
+    MASTER_URL="$raw_url"
+    SELECTED_NAME="$label"
+    SELECTED_SHORT="manual"
+    SELECTED_CATEGORY="Manual"
+    SELECTED_NOTES=""
+    SELECTED_SOURCE="$source"
+    SELECTED_PROBE_SUMMARY=""
+    SELECTED_STREAM_USER_AGENT=""
+    SELECTED_CATALOG_INDEX=""
+    ACTIVE_HTTP_USER_AGENT="$HTTP_USER_AGENT"
+    STREAM_SELECTION_VALIDATED=0
+}
+
+probe_stream_fields() {
+    local url="$1"
+    local user_agent="$2"
+    local timeout_sec="$3"
+
+    python3 - <<'PY' "$url" "$user_agent" "$timeout_sec"
+import json
+import subprocess
+import sys
+
+url, user_agent, timeout_raw = sys.argv[1:4]
+timeout = float(timeout_raw)
+
+def sanitize(value):
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+def bitrate_label(value):
+    if not value:
+        return ""
+    try:
+        numeric = int(float(value))
+    except Exception:
+        return ""
+    if numeric >= 1_000_000:
+        return f"{numeric / 1_000_000:.1f} Mbps"
+    if numeric >= 1_000:
+        return f"{numeric / 1_000:.0f} kbps"
+    return f"{numeric} bps"
+
+def resolution_label(video):
+    width = video.get("width") or 0
+    height = video.get("height") or 0
+    try:
+        width = int(width)
+        height = int(height)
+    except Exception:
+        width = 0
+        height = 0
+    if height:
+        return f"{height}p"
+    if width and height:
+        return f"{width}x{height}"
+    return ""
+
+cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"]
+if user_agent:
+    cmd.extend(["-user_agent", user_agent])
+cmd.extend(["-i", url])
+
+try:
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+except subprocess.TimeoutExpired:
+    sys.stdout.write("offline\t\t\ttimeout\t")
+    sys.exit(124)
+except FileNotFoundError:
+    sys.stdout.write("offline\t\t\tffprobe not found\t")
+    sys.exit(127)
+
+if proc.returncode != 0 or not proc.stdout.strip():
+    error = proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else "probe failed"
+    sys.stdout.write(f"offline\t\t\t{sanitize(error)}\t")
+    sys.exit(proc.returncode or 1)
+
+try:
+    payload = json.loads(proc.stdout)
+except Exception as exc:
+    sys.stdout.write(f"offline\t\t\t{sanitize(f'parse error: {exc}')}\t")
+    sys.exit(1)
+
+streams = payload.get("streams") or []
+fmt = payload.get("format") or {}
+video = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+resolution = resolution_label(video)
+bitrate = bitrate_label(fmt.get("bit_rate") or video.get("bit_rate") or "")
+summary_parts = [part for part in (resolution, bitrate) if part]
+summary = "  ".join(summary_parts) if summary_parts else "live"
+sys.stdout.write(f"online\t{sanitize(resolution)}\t{sanitize(bitrate)}\t\t{sanitize(summary)}")
+PY
+}
+
+cache_stream_health_result() {
+    local key="$1"
+    local result_line="$2"
+    local status resolution bitrate error summary
+
+    IFS=$'\t' read -r status resolution bitrate error summary <<< "$result_line"
+    status="${status:-offline}"
+    STREAM_HEALTH_STATUS["$key"]="$status"
+    STREAM_HEALTH_RESOLUTION["$key"]="$resolution"
+    STREAM_HEALTH_BITRATE["$key"]="$bitrate"
+    STREAM_HEALTH_ERROR["$key"]="$error"
+    STREAM_HEALTH_PROBE_SUMMARY["$key"]="$summary"
+}
+
+probe_selected_stream_once() {
+    local force_refresh="${1:-0}"
+    local cache_key=""
+    local result_line
+    local status=""
+    local resolution=""
+    local bitrate=""
+    local error=""
+    local summary=""
+
+    if [ -n "$SELECTED_CATALOG_INDEX" ]; then
+        cache_key="$SELECTED_CATALOG_INDEX"
+    fi
+
+    if [ -n "$cache_key" ] && [ "$force_refresh" -eq 0 ] && [ -n "${STREAM_HEALTH_STATUS[$cache_key]:-}" ]; then
+        status="${STREAM_HEALTH_STATUS[$cache_key]}"
+        resolution="${STREAM_HEALTH_RESOLUTION[$cache_key]:-}"
+        bitrate="${STREAM_HEALTH_BITRATE[$cache_key]:-}"
+        error="${STREAM_HEALTH_ERROR[$cache_key]:-}"
+        summary="${STREAM_HEALTH_PROBE_SUMMARY[$cache_key]:-}"
+    else
+        result_line=$(probe_stream_fields "$MASTER_URL" "$ACTIVE_HTTP_USER_AGENT" "$STREAM_PROBE_TIMEOUT_SEC")
+        IFS=$'\t' read -r status resolution bitrate error summary <<< "$result_line"
+        status="${status:-offline}"
+        if [ -n "$cache_key" ]; then
+            cache_stream_health_result "$cache_key" "$result_line"
+        fi
+    fi
+
+    if [ "$status" = "online" ]; then
+        SELECTED_PROBE_SUMMARY="$summary"
+        [ -n "$SELECTED_PROBE_SUMMARY" ] || SELECTED_PROBE_SUMMARY="live"
+        return 0
+    fi
+
+    SELECTED_PROBE_SUMMARY=""
+    if [ -n "$error" ]; then
+        STREAM_HEALTH_ERROR["selected"]="$error"
+    else
+        STREAM_HEALTH_ERROR["selected"]="offline"
+    fi
+    return 1
+}
+
+suggest_alternate_stream_index() {
+    local current_idx="$1"
+    local current_short="${CHANNEL_SHORTS[$current_idx]}"
+    local current_category="${CHANNEL_CATEGORIES[$current_idx]}"
+    local sibling_short=""
+    local idx
+
+    if [[ "$current_short" == *-alt ]]; then
+        sibling_short="${current_short%-alt}"
+    else
+        sibling_short="${current_short}-alt"
+    fi
+
+    if [ -n "$sibling_short" ] && [ -n "${CHANNEL_INDEX_BY_SHORT[$sibling_short]:-}" ]; then
+        idx="${CHANNEL_INDEX_BY_SHORT[$sibling_short]}"
+        if [ "$idx" != "$current_idx" ]; then
+            printf '%s\n' "$idx"
+            return 0
+        fi
+    fi
+
+    for (( idx=0; idx<${#CHANNEL_SHORTS[@]}; idx++ )); do
+        [ "$idx" -eq "$current_idx" ] && continue
+        [ "${CHANNEL_CATEGORIES[$idx]}" = "$current_category" ] || continue
+        printf '%s\n' "$idx"
+        return 0
+    done
+
+    return 1
+}
+
+prompt_manual_url() {
+    local raw_url
+
+    echo ""
+    read -rp "  Enter HLS URL: " raw_url
+    raw_url="$(channels_trim "$raw_url")"
+    if [ -z "$raw_url" ]; then
+        echo -e "  ${R}✗ URL cannot be empty${NC}"
+        return 1
+    fi
+    set_selected_manual_stream "$raw_url"
+    return 0
+}
+
+print_stream_picker_menu() {
+    local current_category=""
+    local idx
+    local suffix=""
+
+    print_banner
+    echo ""
+    echo -e "  ${B}Select a stream:${NC}"
+    echo ""
+
+    for (( idx=0; idx<${#CHANNEL_SHORTS[@]}; idx++ )); do
+        if [ "${CHANNEL_CATEGORIES[$idx]}" != "$current_category" ]; then
+            [ -n "$current_category" ] && echo ""
+            current_category="${CHANNEL_CATEGORIES[$idx]}"
+            echo -e "  ${B}── ${current_category} ─────────────────────────────────${NC}"
+        fi
+
+        suffix=""
+        [ "$idx" -eq 0 ] && suffix="  ${Y}★ default${NC}"
+        printf "   %2d)  %-38s%s\n" "$((idx + 1))" "${CHANNEL_NAMES[$idx]}" "$suffix"
+    done
+
+    echo ""
+    echo -e "  ${B}────────────────────────────────────────────────────${NC}"
+    echo -e "   ${W}u)${NC}  Enter a URL manually"
+    echo -e "   ${W}t)${NC}  Test all streams (check which are live)"
+    echo ""
+}
+
+run_stream_probe_batch() {
+    local input_file="$1"
+
+    python3 - <<'PY' "$input_file" "$STREAM_TEST_TIMEOUT_SEC" "$STREAM_TEST_TOTAL_TIMEOUT_SEC" "$STREAM_TEST_MAX_PARALLEL"
+import json
+import subprocess
+import sys
+import time
+
+input_path, per_timeout_raw, total_timeout_raw, max_parallel_raw = sys.argv[1:5]
+per_timeout = float(per_timeout_raw)
+total_timeout = float(total_timeout_raw)
+max_parallel = int(max_parallel_raw)
+
+def sanitize(value):
+    return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+
+def bitrate_label(value):
+    if not value:
+        return ""
+    try:
+        numeric = int(float(value))
+    except Exception:
+        return ""
+    if numeric >= 1_000_000:
+        return f"{numeric / 1_000_000:.1f} Mbps"
+    if numeric >= 1_000:
+        return f"{numeric / 1_000:.0f} kbps"
+    return f"{numeric} bps"
+
+def resolution_label(video):
+    width = video.get("width") or 0
+    height = video.get("height") or 0
+    try:
+        width = int(width)
+        height = int(height)
+    except Exception:
+        width = 0
+        height = 0
+    if height:
+        return f"{height}p"
+    if width and height:
+        return f"{width}x{height}"
+    return ""
+
+def online_result(stdout_text):
+    payload = json.loads(stdout_text)
+    streams = payload.get("streams") or []
+    fmt = payload.get("format") or {}
+    video = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
+    resolution = resolution_label(video)
+    bitrate = bitrate_label(fmt.get("bit_rate") or video.get("bit_rate") or "")
+    summary_parts = [part for part in (resolution, bitrate) if part]
+    summary = "  ".join(summary_parts) if summary_parts else "live"
+    return ("online", resolution, bitrate, "", summary)
+
+def offline_result(error):
+    return ("offline", "", "", sanitize(error or "offline"), "")
+
+entries = []
+with open(input_path, "r", encoding="utf-8") as handle:
+    for raw_line in handle:
+        line = raw_line.rstrip("\n")
+        if not line:
+            continue
+        idx, url, user_agent = line.split("\t")
+        entries.append((int(idx), url, user_agent))
+
+pending = list(entries)
+running = {}
+results = {}
+deadline = time.monotonic() + total_timeout
+
+while pending or running:
+    now = time.monotonic()
+    while pending and len(running) < max_parallel and now < deadline:
+        idx, url, user_agent = pending.pop(0)
+        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"]
+        if user_agent:
+            cmd.extend(["-user_agent", user_agent])
+        cmd.extend(["-i", url])
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError:
+            results[idx] = offline_result("ffprobe not found")
+            now = time.monotonic()
+            continue
+        running[idx] = {"proc": proc, "started": time.monotonic()}
+        now = time.monotonic()
+
+    now = time.monotonic()
+    finished = []
+    for idx, meta in list(running.items()):
+        proc = meta["proc"]
+        timed_out = (now - meta["started"]) >= per_timeout or now >= deadline
+        if proc.poll() is None and not timed_out:
+            continue
+
+        if proc.poll() is None:
+            proc.kill()
+        stdout_text, stderr_text = proc.communicate()
+
+        if timed_out:
+            results[idx] = offline_result("timeout")
+        elif proc.returncode != 0 or not stdout_text.strip():
+            error = stderr_text.strip().splitlines()[-1] if stderr_text.strip() else "probe failed"
+            results[idx] = offline_result(error)
+        else:
+            try:
+                results[idx] = online_result(stdout_text)
+            except Exception as exc:
+                results[idx] = offline_result(f"parse error: {exc}")
+        finished.append(idx)
+
+    for idx in finished:
+        running.pop(idx, None)
+
+    if time.monotonic() >= deadline:
+        for idx, meta in list(running.items()):
+            proc = meta["proc"]
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+            results[idx] = offline_result("timeout")
+            running.pop(idx, None)
+        for idx, _url, _user_agent in pending:
+            results[idx] = offline_result("timeout")
+        pending = []
+        break
+
+    if running:
+        time.sleep(0.1)
+
+for idx in sorted(results):
+    status, resolution, bitrate, error, summary = results[idx]
+    print(
+        f"{idx}\t{sanitize(status)}\t{sanitize(resolution)}\t{sanitize(bitrate)}\t{sanitize(error)}\t{sanitize(summary)}"
+    )
+PY
+}
+
+test_all_streams() {
+    local current_category=""
+    local input_file
+    local result_file
+    local idx
+    local online_count=0
+    local offline_count=0
+    local status resolution bitrate error summary detail
+
+    ensure_catalog_loaded || {
+        echo -e "${R}✗ Failed to load channel catalog${NC}"
+        return 1
+    }
+    ensure_selection_dependencies
+
+    input_file=$(make_temp_file stream-batch)
+    result_file=$(make_temp_file stream-results)
+    track_temp_file "$input_file"
+    track_temp_file "$result_file"
+
+    : > "$input_file"
+    for (( idx=0; idx<${#CHANNEL_SHORTS[@]}; idx++ )); do
+        if [ -z "${STREAM_HEALTH_STATUS[$idx]:-}" ]; then
+            if ua=$(channels_user_agent_from_notes "${CHANNEL_NOTES[$idx]}" 2>/dev/null); then
+                printf '%s\t%s\t%s\n' "$idx" "${CHANNEL_URLS[$idx]}" "$ua" >> "$input_file"
+            else
+                printf '%s\t%s\t\n' "$idx" "${CHANNEL_URLS[$idx]}" >> "$input_file"
+            fi
+        fi
+    done
+
+    echo ""
+    if [ -s "$input_file" ]; then
+        echo -e "  ${D}Testing all streams... (this takes ~15 seconds)${NC}"
+        run_stream_probe_batch "$input_file" > "$result_file"
+        while IFS=$'\t' read -r idx status resolution bitrate error summary; do
+            cache_stream_health_result "$idx" "${status}	${resolution}	${bitrate}	${error}	${summary}"
+        done < "$result_file"
+    else
+        echo -e "  ${D}Using cached stream health from this session${NC}"
+    fi
+
+    echo ""
+    for (( idx=0; idx<${#CHANNEL_SHORTS[@]}; idx++ )); do
+        if [ "${CHANNEL_CATEGORIES[$idx]}" != "$current_category" ]; then
+            [ -n "$current_category" ] && echo ""
+            current_category="${CHANNEL_CATEGORIES[$idx]}"
+            echo -e "  ${B}── ${current_category} ─────────────────────────────────${NC}"
+        fi
+
+        status="${STREAM_HEALTH_STATUS[$idx]:-offline}"
+        resolution="${STREAM_HEALTH_RESOLUTION[$idx]:-}"
+        bitrate="${STREAM_HEALTH_BITRATE[$idx]:-}"
+        error="${STREAM_HEALTH_ERROR[$idx]:-offline}"
+        summary="${STREAM_HEALTH_PROBE_SUMMARY[$idx]:-}"
+
+        if [ "$status" = "online" ]; then
+            online_count=$((online_count + 1))
+            detail="${summary:-live}"
+            printf "    ${G}✓${NC}  %-38s %s\n" "${CHANNEL_NAMES[$idx]}" "$detail"
+        else
+            offline_count=$((offline_count + 1))
+            detail="${error:-offline}"
+            printf "    ${R}✗${NC}  %-38s %s\n" "${CHANNEL_NAMES[$idx]}" "$detail"
+        fi
+    done
+
+    echo ""
+    echo -e "  ${#CHANNEL_SHORTS[@]} streams tested: ${online_count} online, ${offline_count} offline"
+    return 0
+}
+
+validate_selected_stream() {
+    local interactive_mode="${1:-0}"
+    local force_refresh=0
+    local alternate_index=""
+    local error_message=""
+    local choice=""
+
+    ensure_selection_dependencies
+
+    while true; do
+        if probe_selected_stream_once "$force_refresh"; then
+            STREAM_SELECTION_VALIDATED=1
+            unset STREAM_HEALTH_ERROR["selected"]
+            echo ""
+            echo -e "  ${G}✓${NC} ${SELECTED_NAME}"
+            [ -n "$SELECTED_PROBE_SUMMARY" ] && echo -e "    ${D}${SELECTED_PROBE_SUMMARY}${NC}"
+            [ -n "$SELECTED_NOTES" ] && echo -e "    ${D}${SELECTED_NOTES}${NC}"
+            echo ""
+            return 0
+        fi
+
+        error_message="${STREAM_HEALTH_ERROR[selected]:-}"
+        if [ -z "$error_message" ] && [ -n "$SELECTED_CATALOG_INDEX" ]; then
+            error_message="${STREAM_HEALTH_ERROR[$SELECTED_CATALOG_INDEX]:-offline}"
+        fi
+        [ -n "$error_message" ] || error_message="offline"
+        echo ""
+        echo -e "  ${R}✗ ${SELECTED_NAME} appears to be offline${NC}"
+        [ -n "$error_message" ] && echo -e "    ${D}${error_message}${NC}"
+
+        if [ -n "$SELECTED_CATALOG_INDEX" ]; then
+            alternate_index="$(suggest_alternate_stream_index "$SELECTED_CATALOG_INDEX" || true)"
+        else
+            alternate_index=""
+        fi
+
+        if [ "$interactive_mode" -ne 1 ] || [ ! -t 0 ]; then
+            if [ -n "$alternate_index" ]; then
+                echo -e "  ${D}Suggested alternate: ${CHANNEL_NAMES[$alternate_index]} (--stream ${CHANNEL_SHORTS[$alternate_index]})${NC}"
+            fi
+            return 1
+        fi
+
+        echo ""
+        echo "  Options:"
+        echo "    r)  Retry"
+        if [ -n "$alternate_index" ]; then
+            echo "    a)  Try alternate: ${CHANNEL_NAMES[$alternate_index]}"
+        fi
+        echo "    b)  Back to stream list"
+        echo "    u)  Enter URL manually"
+        echo ""
+
+        if [ -n "$alternate_index" ]; then
+            read -rp "  Select [r, a, b, u]: " choice
+        else
+            read -rp "  Select [r, b, u]: " choice
+        fi
+        choice="$(channels_short_key "$(channels_trim "$choice")")"
+
+        case "$choice" in
+            r|"")
+                force_refresh=1
+                ;;
+            a)
+                if [ -n "$alternate_index" ]; then
+                    set_selected_stream_from_index "$alternate_index"
+                    force_refresh=0
+                fi
+                ;;
+            b)
+                return 2
+                ;;
+            u)
+                if prompt_manual_url; then
+                    force_refresh=1
+                fi
+                ;;
+            *)
+                echo -e "  ${R}✗ Invalid choice${NC}"
+                ;;
+        esac
+    done
+}
+
+select_stream_interactively() {
+    local selection=""
+    local selected_index=""
+    local validation_rc=0
+
+    ensure_catalog_loaded || {
+        echo -e "${R}✗ Failed to load channel catalog${NC}"
+        exit 1
+    }
+
+    while true; do
+        print_stream_picker_menu
+        read -rp "  Select [1-${#CHANNEL_SHORTS[@]}, u, t]: " selection
+        selection="$(channels_trim "$selection")"
+
+        if [ -z "$selection" ]; then
+            set_selected_stream_from_index 0
+        else
+            case "$(channels_short_key "$selection")" in
+                u)
+                    prompt_manual_url || continue
+                    ;;
+                t)
+                    test_all_streams
+                    echo ""
+                    read -rp "  Press Enter to return to stream selection... " _
+                    continue
+                    ;;
+                *)
+                    if selected_index=$(resolve_stream_index "$selection"); then
+                        set_selected_stream_from_index "$selected_index"
+                    else
+                        echo ""
+                        echo -e "  ${R}✗ Unknown stream selection: ${selection}${NC}"
+                        sleep 1
+                        continue
+                    fi
+                    ;;
+            esac
+        fi
+
+        validate_selected_stream 1
+        validation_rc=$?
+        if [ "$validation_rc" -eq 0 ]; then
+            return 0
+        fi
+        if [ "$validation_rc" -eq 2 ]; then
+            continue
+        fi
+    done
+}
+
+initialize_stream_selection() {
+    local selected_index=""
+
+    if [ -n "$MASTER_URL" ]; then
+        set_selected_manual_stream "$MASTER_URL" "Direct URL" "direct-url"
+        return 0
+    fi
+
+    if [ -n "$STREAM_SELECTOR" ]; then
+        ensure_catalog_loaded || {
+            echo -e "${R}✗ Failed to load channel catalog${NC}"
+            exit 1
+        }
+        if ! selected_index=$(resolve_stream_index "$STREAM_SELECTOR"); then
+            echo -e "${R}✗ Unknown stream selector: ${STREAM_SELECTOR}${NC}"
+            exit 1
+        fi
+        set_selected_stream_from_index "$selected_index"
+        return 0
+    fi
+
+    ensure_catalog_loaded || {
+        echo -e "${R}✗ Failed to load channel catalog${NC}"
+        exit 1
+    }
+
+    if [ ! -t 0 ]; then
+        set_selected_stream_from_index 0
+        echo -e "  ${D}No interactive stream input detected — defaulting to ${SELECTED_NAME}${NC}"
+        return 0
+    fi
+
+    select_stream_interactively
 }
 
 format_seg_num() {
@@ -670,11 +1433,11 @@ monitor_try_live_cc_method() {
     local log_file="$4"
     case "$method" in
         subtitle-map)
-            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MASTER_URL" -t "$duration" -map 0:s:0? -c:s srt "$out_file" \
+            ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$MASTER_URL" -t "$duration" -map 0:s:0? -c:s srt "$out_file" \
                 > /dev/null 2>"$log_file"
             ;;
         subtitle-codec-map)
-            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$duration" -codec:s srt -map 0:s? "$out_file" \
+            ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$duration" -codec:s srt -map 0:s? "$out_file" \
                 > /dev/null 2>"$log_file"
             ;;
         *)
@@ -710,7 +1473,7 @@ monitor_extract_cc_from_file() {
 
 monitor_refresh_stream_targets() {
     local refreshed_content refreshed_best refreshed_summary
-    refreshed_content=$(curl -fsSL -A "$HTTP_USER_AGENT" "$MASTER_URL" 2>/dev/null) || return 1
+    refreshed_content=$(curl -fsSL -A "$ACTIVE_HTTP_USER_AGENT" "$MASTER_URL" 2>/dev/null) || return 1
     MONITOR_HAS_CC_DECLARED=0
     MONITOR_HAS_SUBTITLE_DECLARED=0
     echo "$refreshed_content" | grep -q 'TYPE=CLOSED-CAPTIONS' && MONITOR_HAS_CC_DECLARED=1
@@ -749,7 +1512,7 @@ PY
 )
     [ -n "$refreshed_best" ] || return 1
     MONITOR_BEST_URL="$refreshed_best"
-    refreshed_summary=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -print_format json -show_format -show_streams -i "$MONITOR_BEST_URL" 2>/dev/null \
+    refreshed_summary=$(ffprobe -user_agent "$ACTIVE_HTTP_USER_AGENT" -v quiet -print_format json -show_format -show_streams -i "$MONITOR_BEST_URL" 2>/dev/null \
         | python3 - <<'PY'
 import json
 import sys
@@ -809,7 +1572,7 @@ monitor_detect_cc_method() {
 
     sample_ts="${temp_dir}/sample.ts"
     sample_log="${temp_dir}/sample.log"
-    if ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$diag_sec" -map 0:v:0 -map 0:a? -c copy -f mpegts "$sample_ts" \
+    if ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$diag_sec" -map 0:v:0 -map 0:a? -c copy -f mpegts "$sample_ts" \
         > /dev/null 2>"$sample_log"; then
         file_srt="${temp_dir}/lavfi-subcc.srt"
         file_log="${temp_dir}/lavfi-subcc.log"
@@ -924,7 +1687,7 @@ monitor_record_segment() {
     track_temp_file "$clog"
     track_temp_file "$stall_marker"
 
-    ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$MONITOR_SEGMENT_SEC" \
+    ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$MONITOR_SEGMENT_SEC" \
         -c:v copy -c:a copy -movflags +faststart -loglevel warning -stats \
         "$mp4_file" 2>"$vlog" &
     video_pid=$!
@@ -935,13 +1698,13 @@ monitor_record_segment() {
     cc_pid=""
     case "$MONITOR_CC_METHOD" in
         subtitle-map)
-            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MASTER_URL" -t "$MONITOR_SEGMENT_SEC" -map 0:s:0? -c:s srt "$srt_file" \
+            ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$MASTER_URL" -t "$MONITOR_SEGMENT_SEC" -map 0:s:0? -c:s srt "$srt_file" \
                 > /dev/null 2>"$clog" &
             cc_pid=$!
             track_pid "$cc_pid"
             ;;
         subtitle-codec-map)
-            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$MONITOR_SEGMENT_SEC" -codec:s srt -map 0:s? "$srt_file" \
+            ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$MONITOR_BEST_URL" -t "$MONITOR_SEGMENT_SEC" -codec:s srt -map 0:s? "$srt_file" \
                 > /dev/null 2>"$clog" &
             cc_pid=$!
             track_pid "$cc_pid"
@@ -1042,6 +1805,7 @@ monitor_print_summary() {
     echo -e "${C}${B}╔═══════════════════════════════════════════════════════════╗${NC}"
     echo -e "${C}${B}║  Keyword Monitor Complete — $(date +%H:%M:%S)                 ║${NC}"
     echo -e "${C}${B}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${B}Stream${NC}      ${SELECTED_NAME}"
     echo -e "  ${B}Segments${NC}    ${MONITOR_LAST_SEGMENT_RECORDED}"
     echo -e "  ${B}Matches${NC}     ${MONITOR_MATCHES_FOUND}"
     echo -e "  ${B}Kept folders${NC} ${kept_dirs}"
@@ -1180,6 +1944,32 @@ while [ "$#" -gt 0 ]; do
         -q|--quiet)
             QUIET=1
             ;;
+        --stream)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --stream${NC}"; exit 1; }
+            [ -z "$STREAM_SELECTOR" ] || { echo -e "${R}✗ Only one --stream value may be provided${NC}"; exit 1; }
+            STREAM_SELECTOR="$2"
+            shift
+            ;;
+        --stream=*)
+            [ -z "$STREAM_SELECTOR" ] || { echo -e "${R}✗ Only one --stream value may be provided${NC}"; exit 1; }
+            STREAM_SELECTOR="${1#*=}"
+            ;;
+        --test-streams)
+            STREAM_TEST_FLAG=1
+            ;;
+        --update-channels)
+            UPDATE_CHANNELS_FLAG=1
+            ;;
+        --mode)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --mode${NC}"; exit 1; }
+            [ -z "$MODE_OVERRIDE" ] || { echo -e "${R}✗ Only one --mode value may be provided${NC}"; exit 1; }
+            MODE_OVERRIDE="$2"
+            shift
+            ;;
+        --mode=*)
+            [ -z "$MODE_OVERRIDE" ] || { echo -e "${R}✗ Only one --mode value may be provided${NC}"; exit 1; }
+            MODE_OVERRIDE="${1#*=}"
+            ;;
         --monitor)
             MONITOR_FLAG=1
             ;;
@@ -1249,8 +2039,33 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -z "$MASTER_URL" ] || [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
-MASTER_URL="${MASTER_URL:-${POSITIONAL_URL:-$DEFAULT_MASTER_URL}}"
+MASTER_URL="${MASTER_URL:-$POSITIONAL_URL}"
 OUT_DIR="${OUTPUT_OVERRIDE:-$DEFAULT_OUTPUT_DIR}"
+
+if [ -n "$STREAM_SELECTOR" ] && [ -n "$MASTER_URL" ]; then
+    echo -e "${R}✗ Use either --stream or a direct URL, not both${NC}"
+    exit 1
+fi
+
+if [ "$MONITOR_FLAG" -eq 1 ]; then
+    if [ -n "$MODE_OVERRIDE" ]; then
+        MODE_OVERRIDE_NORMALIZED=$(normalize_mode_selector "$MODE_OVERRIDE" 2>/dev/null || true)
+        if [ "$MODE_OVERRIDE_NORMALIZED" != "4" ]; then
+            echo -e "${R}✗ --monitor cannot be combined with a different --mode${NC}"
+            exit 1
+        fi
+    fi
+    MODE_OVERRIDE="4"
+fi
+
+if [ -n "$MODE_OVERRIDE" ]; then
+    RAW_MODE_OVERRIDE="$MODE_OVERRIDE"
+    if ! MODE_OVERRIDE="$(normalize_mode_selector "$MODE_OVERRIDE")"; then
+        echo -e "${R}✗ Invalid --mode value: ${RAW_MODE_OVERRIDE}${NC}"
+        exit 1
+    fi
+    [ "$MODE_OVERRIDE" = "4" ] && MONITOR_FLAG=1
+fi
 
 if ! [[ "$MONITOR_SEGMENT_SEC" =~ ^[0-9]+$ ]] || [ "$MONITOR_SEGMENT_SEC" -lt 30 ] || [ "$MONITOR_SEGMENT_SEC" -gt 3600 ]; then
     echo -e "${R}✗ --segment-length must be between 30 and 3600 seconds${NC}"
@@ -1263,17 +2078,38 @@ if [ -n "$MONITOR_UNTIL_RAW" ]; then
     fi
 fi
 
+if [ "$UPDATE_CHANNELS_FLAG" -eq 1 ]; then
+    echo "Coming soon - for now, edit channels.conf manually"
+    exit 0
+fi
+
+if [ "$STREAM_TEST_FLAG" -eq 1 ]; then
+    test_all_streams
+    exit 0
+fi
+
+initialize_stream_selection
+
+if [ "$STREAM_SELECTION_VALIDATED" -eq 0 ]; then
+    validate_selected_stream 0 || exit 1
+fi
+
 # ══════════════════════════════════════════════════════════
 # MODE SELECTION
 # ══════════════════════════════════════════════════════════
-if [ "$QUIET" -eq 0 ] && [ -t 1 ]; then
-    clear
-fi
-echo -e "${C}${B}╔═══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${C}${B}║          📡  HLS Stream Recorder  —  MAX QUALITY         ║${NC}"
-echo -e "${C}${B}╚═══════════════════════════════════════════════════════════╝${NC}"
+print_banner
 echo ""
+echo -e "  ${B}Stream${NC}     ${SELECTED_NAME}"
+if [ -n "$SELECTED_SHORT" ] && [ "$SELECTED_SHORT" != "manual" ]; then
+    echo -e "  ${B}Short${NC}      ${SELECTED_SHORT}"
+fi
 echo -e "  ${B}Master${NC}     $MASTER_URL"
+if [ -n "$SELECTED_PROBE_SUMMARY" ]; then
+    echo -e "  ${B}Probe${NC}      ${SELECTED_PROBE_SUMMARY}"
+fi
+if [ -n "$SELECTED_NOTES" ]; then
+    echo -e "  ${B}Notes${NC}      ${SELECTED_NOTES}"
+fi
 echo ""
 echo -e "  ${B}Choose recording mode:${NC}"
 echo ""
@@ -1282,9 +2118,13 @@ echo -e "    ${W}2)${NC}  Record now — enter a custom duration"
 echo -e "    ${W}3)${NC}  Record now — enter start & end times"
 echo -e "    ${W}4)${NC}  ⚡ Keyword monitor ${Y}(experimental)${NC} — record on keyword detection"
 echo ""
-if [ "$MONITOR_FLAG" -eq 1 ]; then
-    MODE_CHOICE=4
-    echo -e "  ${D}Mode selected via --monitor${NC}"
+if [ -n "$MODE_OVERRIDE" ]; then
+    MODE_CHOICE="$MODE_OVERRIDE"
+    if [ "$MODE_CHOICE" = "4" ]; then
+        echo -e "  ${D}Mode selected via CLI override${NC}"
+    else
+        echo -e "  ${D}Mode ${MODE_CHOICE} selected via CLI override${NC}"
+    fi
 else
     read -rp "  Select [1/2/3/4]: " MODE_CHOICE
 fi
@@ -1383,7 +2223,7 @@ echo ""
 echo -e "${B}─── Parsing Master Playlist ────────────────────────────────${NC}"
 echo -e "  ${D}Fetching ${MASTER_URL}${NC}"
 
-MASTER_CONTENT=$(curl -fsSL -A "$HTTP_USER_AGENT" "$MASTER_URL" 2>/dev/null)
+MASTER_CONTENT=$(curl -fsSL -A "$ACTIVE_HTTP_USER_AGENT" "$MASTER_URL" 2>/dev/null)
 if [ -z "$MASTER_CONTENT" ]; then
     echo -e "  ${R}✗ Failed to fetch master playlist${NC}"
     exit 1
@@ -1480,7 +2320,7 @@ echo ""
 
 # ── Probe the selected variant ──
 echo -e "${B}─── Stream Details (best variant) ──────────────────────────${NC}"
-PROBE_JSON=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -print_format json -show_format -show_streams -i "$BEST_URL" 2>/dev/null)
+PROBE_JSON=$(ffprobe -user_agent "$ACTIVE_HTTP_USER_AGENT" -v quiet -print_format json -show_format -show_streams -i "$BEST_URL" 2>/dev/null)
 if [ -n "$PROBE_JSON" ]; then
     echo "$PROBE_JSON" | python3 -c "
 import sys, json
@@ -1556,7 +2396,7 @@ TLOG=$(make_temp_file fftest)
 track_temp_file "$TEST_FILE"
 track_temp_file "$TLOG"
 
-ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$BEST_URL" -t "$TEST_SEC" \
+ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$BEST_URL" -t "$TEST_SEC" \
     -c copy -movflags +faststart \
     -loglevel warning -stats \
     "$TEST_FILE" 2>"$TLOG" &
@@ -1711,7 +2551,7 @@ record_window() {
             track_temp_file "$SLOG"
 
             # Main video
-            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$BEST_URL" -t "$THIS_SEG_SEC" \
+            ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$BEST_URL" -t "$THIS_SEG_SEC" \
                 -c:v copy -c:a copy \
                 -movflags +faststart -loglevel warning -stats \
                 "$SEG_FILE" 2>"$SLOG" &
@@ -1725,7 +2565,7 @@ record_window() {
             # CC extraction
             CCLOG=$(make_temp_file ffcc)
             track_temp_file "$CCLOG"
-            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
+            ffmpeg -y -user_agent "$ACTIVE_HTTP_USER_AGENT" -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
                 -map 0:s:0? -c:s srt -loglevel error \
                 "$SRT_FILE" 2>"$CCLOG" &
             CC_PID=$!
@@ -1792,7 +2632,7 @@ record_window() {
             SB=$(wc -c < "$SEG_FILE" | tr -d ' ')
             TOTAL_SIZE=$((TOTAL_SIZE + SB))
             SEG_OK=$((SEG_OK + 1))
-            SEG_RES=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -select_streams v:0 \
+            SEG_RES=$(ffprobe -user_agent "$ACTIVE_HTTP_USER_AGENT" -v quiet -select_streams v:0 \
                 -show_entries stream=width,height -of csv=p=0 "$SEG_FILE" 2>/dev/null)
             echo -e "    ${G}✓${NC} Video  $(human_size "$SB")  ${D}[${SEG_RES}]${NC}"
         else
@@ -1842,6 +2682,7 @@ echo -e "${C}${B}╔════════════════════
 echo -e "${C}${B}║  Recording Complete — $(date +%H:%M:%S)                            ║${NC}"
 echo -e "${C}${B}╚═══════════════════════════════════════════════════════════╝${NC}"
 echo ""
+echo -e "  ${B}Stream${NC}      ${SELECTED_NAME}"
 echo -e "  ${B}Quality${NC}     1080p (highest variant)"
 echo -e "  ${B}Windows${NC}     ${NUM_WINDOWS}"
 echo -e "  ${B}Segments${NC}    ${G}${GRAND_SEG_OK} ok${NC}  ${R}${GRAND_SEG_FAIL} failed${NC}  /  ${GLOBAL_SEG_NUM} total"
