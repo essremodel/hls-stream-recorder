@@ -75,7 +75,7 @@ Built-in channels use a simple pipe-delimited format:
 Category|short_name|Display Name|https://url/master.m3u8|Optional notes
 ```
 
-Edit [`channels.conf`](./channels.conf) to change the built-in list. For personal or private streams, use `streams.txt` with the same format. If a provider requires a specific User-Agent, note it as `ua=...` in the `notes` field so the recorder can apply it for that entry.
+Edit [`channels.conf`](./channels.conf) to change the built-in list. For personal or private streams, use `streams.txt` with the same format. If a provider requires a specific User-Agent, note it as `ua=...` or `user-agent=...` in the `notes` field. Quote the value when it contains semicolons, for example `user-agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"` so the recorder keeps the full browser string intact.
 
 ### Channel Sources
 

@@ -397,14 +397,52 @@ load_stream_catalog() {
 
 stream_note_user_agent() {
     local notes="$1"
-    local user_agent=""
-    case "$notes" in
-        *ua=*)
-            user_agent="${notes##*ua=}"
-            user_agent="${user_agent%%;*}"
-            trim_ws "$user_agent"
-            ;;
-    esac
+    python3 - <<'PY' "$notes"
+import sys
+
+notes = sys.argv[1]
+tokens = []
+current = []
+quote = None
+i = 0
+
+while i < len(notes):
+    char = notes[i]
+    if quote:
+        if char == "\\" and i + 1 < len(notes):
+            i += 1
+            current.append(notes[i])
+        elif char == quote:
+            quote = None
+        else:
+            current.append(char)
+    else:
+        if char == ";":
+            token = "".join(current).strip()
+            if token:
+                tokens.append(token)
+            current = []
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "\\" and i + 1 < len(notes):
+            i += 1
+            current.append(notes[i])
+        else:
+            current.append(char)
+    i += 1
+
+token = "".join(current).strip()
+if token:
+    tokens.append(token)
+
+for token in tokens:
+    lowered = token.lower()
+    if lowered.startswith("ua=") or lowered.startswith("user-agent="):
+        value = token.split("=", 1)[1].strip()
+        if value:
+            print(value)
+            break
+PY
 }
 
 stream_user_agent_for_index() {
