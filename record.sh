@@ -310,6 +310,11 @@ Record an HLS stream at the highest available quality.
 Options:
   -h, --help          Show this help text and exit
   -q, --quiet         Suppress progress animations
+      --monitor       Enable keyword monitor mode (experimental)
+      --keywords FILE Use FILE for monitor keywords (default: keywords.txt)
+      --until TIME    Stop monitor mode at TIME (e.g. 23:00)
+      --segment-length SEC
+                      Use SEC-second segments for monitor mode (default: 150)
       --url URL       Use URL as the HLS master playlist
       --output DIR    Write recordings to DIR
 
@@ -320,6 +325,7 @@ Examples:
   $(basename "$0") https://your-stream.com/index.m3u8
   $(basename "$0") --url https://your-stream.com/index.m3u8 --output /tmp/capture
   echo 1 | $(basename "$0") --quiet https://your-stream.com/index.m3u8
+  $(basename "$0") --monitor --keywords ./keywords.txt --until 23:00
 EOF
 }
 
@@ -1162,6 +1168,33 @@ while [ "$#" -gt 0 ]; do
         -q|--quiet)
             QUIET=1
             ;;
+        --monitor)
+            MONITOR_FLAG=1
+            ;;
+        --keywords)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --keywords${NC}"; exit 1; }
+            MONITOR_KEYWORDS_FILE="$2"
+            shift
+            ;;
+        --keywords=*)
+            MONITOR_KEYWORDS_FILE="${1#*=}"
+            ;;
+        --until)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --until${NC}"; exit 1; }
+            MONITOR_UNTIL_RAW="$2"
+            shift
+            ;;
+        --until=*)
+            MONITOR_UNTIL_RAW="${1#*=}"
+            ;;
+        --segment-length)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --segment-length${NC}"; exit 1; }
+            MONITOR_SEGMENT_SEC="$2"
+            shift
+            ;;
+        --segment-length=*)
+            MONITOR_SEGMENT_SEC="${1#*=}"
+            ;;
         --url)
             [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --url${NC}"; exit 1; }
             [ -z "$MASTER_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
@@ -1207,6 +1240,17 @@ done
 MASTER_URL="${MASTER_URL:-${POSITIONAL_URL:-$DEFAULT_MASTER_URL}}"
 OUT_DIR="${OUTPUT_OVERRIDE:-$DEFAULT_OUTPUT_DIR}"
 
+if ! [[ "$MONITOR_SEGMENT_SEC" =~ ^[0-9]+$ ]] || [ "$MONITOR_SEGMENT_SEC" -lt 30 ] || [ "$MONITOR_SEGMENT_SEC" -gt 3600 ]; then
+    echo -e "${R}✗ --segment-length must be between 30 and 3600 seconds${NC}"
+    exit 1
+fi
+if [ -n "$MONITOR_UNTIL_RAW" ]; then
+    if ! MONITOR_UNTIL_SEC=$(parse_time "$MONITOR_UNTIL_RAW"); then
+        echo -e "${R}✗ Invalid --until time${NC}"
+        exit 1
+    fi
+fi
+
 # ══════════════════════════════════════════════════════════
 # MODE SELECTION
 # ══════════════════════════════════════════════════════════
@@ -1226,7 +1270,12 @@ echo -e "    ${W}2)${NC}  Record now — enter a custom duration"
 echo -e "    ${W}3)${NC}  Record now — enter start & end times"
 echo -e "    ${W}4)${NC}  ⚡ Keyword monitor ${Y}(experimental)${NC} — record on keyword detection"
 echo ""
-read -rp "  Select [1/2/3/4]: " MODE_CHOICE
+if [ "$MONITOR_FLAG" -eq 1 ]; then
+    MODE_CHOICE=4
+    echo -e "  ${D}Mode selected via --monitor${NC}"
+else
+    read -rp "  Select [1/2/3/4]: " MODE_CHOICE
+fi
 echo ""
 
 # Build the list of recording windows based on mode
