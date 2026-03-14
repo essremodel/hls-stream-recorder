@@ -460,6 +460,7 @@ ${MONITOR_MATCH_HITS[$secondary]}"
     unset MONITOR_MATCH_HITS["$secondary"]
     unset MONITOR_MATCH_DIR["$secondary"]
     unset MONITOR_MATCH_FINALIZED["$secondary"]
+    monitor_log "Merged overlapping match ${secondary} into match ${primary}"
 }
 
 monitor_register_match() {
@@ -547,6 +548,7 @@ monitor_promote_segment() {
     [ -f "${MONITOR_SEG_MP4[$seg]:-}" ] && mv "${MONITOR_SEG_MP4[$seg]}" "$pending_dir"/
     [ -f "${MONITOR_SEG_SRT[$seg]:-}" ] && mv "${MONITOR_SEG_SRT[$seg]}" "$pending_dir"/
     [ -f "${MONITOR_SEG_TXT[$seg]:-}" ] && mv "${MONITOR_SEG_TXT[$seg]}" "$pending_dir"/
+    monitor_log "SEG $(format_seg_num "$seg") PROMOTED to $(basename "$pending_dir")/"
     unset MONITOR_SEG_MP4["$seg"]
     unset MONITOR_SEG_SRT["$seg"]
     unset MONITOR_SEG_TXT["$seg"]
@@ -876,23 +878,27 @@ monitor_render_status() {
     MONITOR_STATUS_LINES="$status_lines"
 }
 
+monitor_force_flush_buffer() {
+    local seg
+    for (( seg=1; seg<=MONITOR_LAST_SEGMENT_RECORDED; seg++ )); do
+        [ -n "${MONITOR_SEG_MP4[$seg]:-}" ] || continue
+        if [ -n "${MONITOR_FLAGGED_SEGMENTS[$seg]:-}" ]; then
+            monitor_promote_segment "$seg"
+        else
+            monitor_cleanup_buffer_segment "$seg" "low disk flush"
+        fi
+    done
+}
+
 monitor_disk_guard() {
     local free_kb
-    local seg
 
     free_kb=$(disk_free_kb "$OUT_DIR")
     [ -n "$free_kb" ] || return 0
 
     if [ "$free_kb" -lt 1048576 ]; then
         monitor_log "WARNING: disk below 1 GB free — forcing buffer flush"
-        for (( seg=1; seg<=MONITOR_LAST_SEGMENT_RECORDED; seg++ )); do
-            [ -n "${MONITOR_SEG_MP4[$seg]:-}" ] || continue
-            if [ -n "${MONITOR_FLAGGED_SEGMENTS[$seg]:-}" ]; then
-                monitor_promote_segment "$seg"
-            else
-                monitor_cleanup_buffer_segment "$seg" "low disk flush"
-            fi
-        done
+        monitor_force_flush_buffer
     fi
 
     free_kb=$(disk_free_kb "$OUT_DIR")
@@ -1046,10 +1052,16 @@ monitor_print_summary() {
 monitor_cleanup_on_exit() {
     local exit_code="$1"
     [ "$MONITOR_ACTIVE" -eq 1 ] || return 0
-    [ "$MONITOR_INTERRUPTED" -eq 1 ] || return 0
     [ "$MONITOR_SUMMARY_PRINTED" -eq 0 ] || return 0
 
-    monitor_log "MONITOR INTERRUPTED — promoting flagged buffer segments before exit"
+    if [ "$MONITOR_INTERRUPTED" -eq 1 ]; then
+        monitor_log "MONITOR INTERRUPTED — promoting flagged buffer segments before exit"
+        monitor_log "BUFFER PRESERVED — unflagged segments left in buffer/ for manual review"
+    elif [ "$exit_code" -ne 0 ]; then
+        monitor_log "MONITOR EXITED WITH ERROR (${exit_code}) — promoting flagged buffer segments before exit"
+    else
+        return 0
+    fi
     monitor_finalize_flagged_segments
     monitor_finalize_ready_matches "$((MONITOR_LAST_SEGMENT_RECORDED + MONITOR_BUFFER_DEPTH + 1))" 1
     monitor_print_summary
