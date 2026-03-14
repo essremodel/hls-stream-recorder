@@ -26,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Startup now resolves the stream first, with an interactive picker by default and direct URL support still available via `--url` or a positional argument.
 - Added a 5-second stream probe before mode selection and a cached parallel stream-health report for the picker's `t` / `--test-streams` path.
 - `.gitignore` now preserves `streams.example.txt` while keeping `streams.txt` and recording artifacts out of the repo.
+- Stream note metadata now accepts quoted `ua=` / `user-agent=` values without truncating standard browser User-Agent strings.
 - Hardened duration and time parsing, including support for inputs like `12am`, `12pm`, and bare-hour values such as `2pm`.
 - Added validation to reject invalid durations, malformed times, and record-now durations that would cross midnight.
 - Replaced several platform-specific shell idioms with more portable helpers for progress bars, temp files, current time, and output-folder opening.
