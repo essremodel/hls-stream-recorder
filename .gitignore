@@ -1,0 +1,5 @@
+recording_*/
+*.mp4
+*.srt
+_test.mp4
+.DS_Store
