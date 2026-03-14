@@ -1,5 +1,11 @@
 recording_*/
+recording_monitor_*/
+buffer/
+kept/
 *.mp4
 *.srt
+*.txt
+!keywords.txt
 _test.mp4
+monitor.log
 .DS_Store

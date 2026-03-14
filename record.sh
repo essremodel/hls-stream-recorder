@@ -8,12 +8,23 @@
 # All files saved next to this script
 # ─────────────────────────────────────────────────────────
 
-MASTER_URL="${1:-https://example.com/stream/index.m3u8}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-OUT_DIR="${SCRIPT_DIR}/recording_$(date +%Y%m%d)"
+DEFAULT_MASTER_URL="https://example.com/stream/index.m3u8"
+HTTP_USER_AGENT="${HLS_RECORDER_USER_AGENT:-Mozilla/5.0 (HLS Stream Recorder)}"
+MASTER_URL=""
+OUT_DIR=""
+OUTPUT_OVERRIDE=""
+QUIET=0
 
 SEGMENT_SEC=300  # 5 minutes
 TEST_SEC=15
+MAX_DURATION_MIN=1440
+SEGMENT_TIMEOUT_MULTIPLIER=2
+SLOW_SEGMENT_GRACE_SEC=15
+
+declare -a TEMP_FILES=()
+declare -a ACTIVE_PIDS=()
+CLEANUP_DONE=0
 
 # ── Scheduled recording windows (24h format) ──
 # Window 1: 5:55 PM → 7:00 PM  (5 min early cushion)
@@ -32,10 +43,11 @@ BG_C='\033[46;30m'; BG_G='\033[42;30m'; BG_R='\033[41;37m'; BG_Y='\033[43;30m'
 SPIN=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
 
 draw_bar() {
-    local pct=$1 w=${2:-30}
+    local pct="$1" w="${2:-30}"
     local f=$((pct * w / 100)) e=$((w - f))
-    printf '█%.0s' $(seq 1 $f 2>/dev/null)
-    printf '░%.0s' $(seq 1 $e 2>/dev/null)
+    local i
+    for (( i=0; i<f; i++ )); do printf '█'; done
+    for (( i=0; i<e; i++ )); do printf '░'; done
 }
 
 human_size() {
@@ -47,10 +59,246 @@ for u in ['B','KB','MB','GB']:
 "
 }
 
+file_size_bytes() {
+    [ -f "$1" ] || return 1
+    wc -c < "$1" | tr -d ' '
+}
+
+now_seconds_of_day() {
+    local hour minute second
+    hour=$(date +%H)
+    minute=$(date +%M)
+    second=$(date +%S)
+    printf '%s\n' "$((10#$hour * 3600 + 10#$minute * 60 + 10#$second))"
+}
+
+make_temp_file() {
+    mktemp "${TMPDIR:-/tmp}/$1.XXXXXX"
+}
+
+open_output_dir() {
+    local out_dir="$1"
+    local os_name
+
+    os_name=$(uname -s 2>/dev/null || echo "")
+    case "$os_name" in
+        Darwin)
+            if command -v open &>/dev/null; then
+                open "$out_dir"
+                echo -e "  ${G}📂 Opened in Finder${NC}"
+            fi
+            ;;
+        Linux)
+            if command -v xdg-open &>/dev/null && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+                xdg-open "$out_dir" >/dev/null 2>&1 &
+                echo -e "  ${G}📂 Opened output folder${NC}"
+            else
+                echo -e "  ${D}Output folder not opened automatically in this environment${NC}"
+            fi
+            ;;
+    esac
+}
+
+start_timeout_watchdog() {
+    local target_pid="$1"
+    local timeout_sec="$2"
+    local marker_file="$3"
+
+    (
+        sleep "$timeout_sec"
+        if kill -0 "$target_pid" 2>/dev/null; then
+            printf 'timeout\n' > "$marker_file"
+            kill "$target_pid" 2>/dev/null || true
+            sleep 5
+            kill -KILL "$target_pid" 2>/dev/null || true
+        fi
+    ) &
+    printf '%s\n' "$!"
+}
+
+stop_timeout_watchdog() {
+    local watchdog_pid="$1"
+    [ -n "$watchdog_pid" ] || return 0
+    kill "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    forget_pid "$watchdog_pid"
+}
+
+track_temp_file() {
+    TEMP_FILES+=("$1")
+}
+
+forget_temp_file() {
+    local target="$1"
+    local kept=()
+    local path
+    for path in "${TEMP_FILES[@]}"; do
+        [ "$path" != "$target" ] && kept+=("$path")
+    done
+    TEMP_FILES=("${kept[@]}")
+}
+
+track_pid() {
+    ACTIVE_PIDS+=("$1")
+}
+
+forget_pid() {
+    local target="$1"
+    local kept=()
+    local pid
+    for pid in "${ACTIVE_PIDS[@]}"; do
+        [ "$pid" != "$target" ] && kept+=("$pid")
+    done
+    ACTIVE_PIDS=("${kept[@]}")
+}
+
+cleanup() {
+    local exit_code="${1:-$?}"
+    local pid
+    local path
+
+    if [ "$CLEANUP_DONE" -eq 1 ]; then
+        return "$exit_code"
+    fi
+    CLEANUP_DONE=1
+
+    for pid in "${ACTIVE_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+
+    for pid in "${ACTIVE_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    for path in "${TEMP_FILES[@]}"; do
+        rm -f "$path"
+    done
+
+    return "$exit_code"
+}
+
+trap 'cleanup $?' EXIT
+trap 'cleanup 130; exit 130' INT
+trap 'cleanup 143; exit 143' TERM
+
+parse_time() {
+    local raw="$1"
+    local cleaned hour minute meridiem
+
+    cleaned=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    [ -z "$cleaned" ] && return 1
+
+    if [[ ! "$cleaned" =~ ^([0-9]{1,2})(:([0-9]{1,2}))?([ap]m)?$ ]]; then
+        return 1
+    fi
+
+    hour=$((10#${BASH_REMATCH[1]}))
+    minute=$((10#${BASH_REMATCH[3]:-0}))
+    meridiem="${BASH_REMATCH[4]:-}"
+
+    if [ "$minute" -gt 59 ]; then
+        return 1
+    fi
+
+    if [ -n "$meridiem" ]; then
+        if [ "$hour" -lt 1 ] || [ "$hour" -gt 12 ]; then
+            return 1
+        fi
+        if [ "$meridiem" = "am" ] && [ "$hour" -eq 12 ]; then
+            hour=0
+        elif [ "$meridiem" = "pm" ] && [ "$hour" -lt 12 ]; then
+            hour=$((hour + 12))
+        fi
+    elif [ "$hour" -gt 23 ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$((hour * 3600 + minute * 60))"
+}
+
+print_usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] [url]
+
+Record an HLS stream at the highest available quality.
+
+Options:
+  -h, --help          Show this help text and exit
+  -q, --quiet         Suppress progress animations
+      --url URL       Use URL as the HLS master playlist
+      --output DIR    Write recordings to DIR
+
+Arguments:
+  url                 HLS master playlist URL (same as --url)
+
+Examples:
+  $(basename "$0") https://your-stream.com/index.m3u8
+  $(basename "$0") --url https://your-stream.com/index.m3u8 --output /tmp/capture
+  echo 1 | $(basename "$0") --quiet https://your-stream.com/index.m3u8
+EOF
+}
+
+POSITIONAL_URL=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        -q|--quiet)
+            QUIET=1
+            ;;
+        --url)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --url${NC}"; exit 1; }
+            [ -z "$MASTER_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+            MASTER_URL="$2"
+            shift
+            ;;
+        --url=*)
+            [ -z "$MASTER_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+            MASTER_URL="${1#*=}"
+            ;;
+        --output)
+            [ "$#" -ge 2 ] || { echo -e "${R}✗ Missing value for --output${NC}"; exit 1; }
+            OUTPUT_OVERRIDE="$2"
+            shift
+            ;;
+        --output=*)
+            OUTPUT_OVERRIDE="${1#*=}"
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo -e "${R}✗ Unknown option: $1${NC}"
+            print_usage
+            exit 1
+            ;;
+        *)
+            [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+            POSITIONAL_URL="$1"
+            ;;
+    esac
+    shift
+done
+
+while [ "$#" -gt 0 ]; do
+    [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+    POSITIONAL_URL="$1"
+    shift
+done
+
+[ -z "$MASTER_URL" ] || [ -z "$POSITIONAL_URL" ] || { echo -e "${R}✗ Only one URL may be provided${NC}"; exit 1; }
+MASTER_URL="${MASTER_URL:-${POSITIONAL_URL:-$DEFAULT_MASTER_URL}}"
+OUT_DIR="${OUTPUT_OVERRIDE:-${SCRIPT_DIR}/recording_$(date +%Y%m%d)}"
+
 # ══════════════════════════════════════════════════════════
 # MODE SELECTION
 # ══════════════════════════════════════════════════════════
-clear
+if [ "$QUIET" -eq 0 ] && [ -t 1 ]; then
+    clear
+fi
 echo -e "${C}${B}╔═══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${C}${B}║          📡  HLS Stream Recorder  —  MAX QUALITY         ║${NC}"
 echo -e "${C}${B}╚═══════════════════════════════════════════════════════════╝${NC}"
@@ -74,12 +322,18 @@ declare -a WIN_LABELS=()   # display labels
 case "$MODE_CHOICE" in
     2)
         read -rp "  How many minutes to record? " CUSTOM_MINS
-        if ! [[ "$CUSTOM_MINS" =~ ^[0-9]+$ ]] || [ "$CUSTOM_MINS" -lt 1 ]; then
-            echo -e "  ${R}✗ Invalid duration${NC}"; exit 1
+        if ! [[ "$CUSTOM_MINS" =~ ^[0-9]+$ ]]; then
+            echo -e "  ${R}✗ Duration must be a whole number of minutes${NC}"; exit 1
         fi
-        NH=$(date +%-H); NM=$(date +%-M)
-        NOW_SEC=$((NH*3600 + NM*60))
+        if [ "$CUSTOM_MINS" -lt 1 ] || [ "$CUSTOM_MINS" -gt "$MAX_DURATION_MIN" ]; then
+            echo -e "  ${R}✗ Duration must be between 1 and ${MAX_DURATION_MIN} minutes${NC}"; exit 1
+        fi
+        NOW_SEC=$(now_seconds_of_day)
+        NOW_SEC=$((NOW_SEC - (NOW_SEC % 60)))
         END_SEC=$((NOW_SEC + CUSTOM_MINS*60))
+        if [ "$END_SEC" -gt 86400 ]; then
+            echo -e "  ${R}✗ Record-now duration cannot cross midnight${NC}"; exit 1
+        fi
         WIN_STARTS+=("$NOW_SEC")
         WIN_ENDS+=("$END_SEC")
         WIN_LABELS+=("Now → +${CUSTOM_MINS}min")
@@ -89,28 +343,12 @@ case "$MODE_CHOICE" in
         echo ""
         read -rp "  Start time: " RAW_START
         read -rp "  End time:   " RAW_END
-
-        parse_time() {
-            local raw="$1"
-            local h m pm=0
-            # Strip spaces
-            raw=$(echo "$raw" | tr -d ' ')
-            # Check for am/pm
-            if echo "$raw" | grep -iq 'pm'; then pm=1; fi
-            if echo "$raw" | grep -iq 'am'; then pm=0; fi
-            raw=$(echo "$raw" | sed 's/[aApPmM]//g')
-            h=$(echo "$raw" | cut -d: -f1)
-            m=$(echo "$raw" | cut -d: -f2 2>/dev/null)
-            [ -z "$m" ] && m=0
-            # Remove leading zeros for arithmetic
-            h=$((10#$h)); m=$((10#$m))
-            if [ "$pm" -eq 1 ] && [ "$h" -lt 12 ]; then h=$((h+12)); fi
-            if [ "$pm" -eq 0 ] && [ "$h" -eq 12 ]; then h=0; fi
-            echo $((h*3600 + m*60))
-        }
-
-        S=$(parse_time "$RAW_START")
-        E=$(parse_time "$RAW_END")
+        if ! S=$(parse_time "$RAW_START"); then
+            echo -e "  ${R}✗ Invalid start time${NC}"; exit 1
+        fi
+        if ! E=$(parse_time "$RAW_END"); then
+            echo -e "  ${R}✗ Invalid end time${NC}"; exit 1
+        fi
         if [ "$E" -le "$S" ]; then
             echo -e "  ${R}✗ End time must be after start time${NC}"; exit 1
         fi
@@ -118,17 +356,17 @@ case "$MODE_CHOICE" in
         EH=$((E/3600)); EM=$(( (E%3600)/60 ))
         WIN_STARTS+=("$S")
         WIN_ENDS+=("$E")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' $SH $SM $EH $EM)")
+        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$SH" "$SM" "$EH" "$EM")")
         ;;
     *)
         # Default: scheduled windows
         WIN_STARTS+=("$((WIN1_START_HOUR*3600 + WIN1_START_MIN*60))")
         WIN_ENDS+=("$((WIN1_END_HOUR*3600 + WIN1_END_MIN*60))")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' $WIN1_START_HOUR $WIN1_START_MIN $WIN1_END_HOUR $WIN1_END_MIN)")
+        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN1_START_HOUR" "$WIN1_START_MIN" "$WIN1_END_HOUR" "$WIN1_END_MIN")")
 
         WIN_STARTS+=("$((WIN2_START_HOUR*3600 + WIN2_START_MIN*60))")
         WIN_ENDS+=("$((WIN2_END_HOUR*3600 + WIN2_END_MIN*60))")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' $WIN2_START_HOUR $WIN2_START_MIN $WIN2_END_HOUR $WIN2_END_MIN)")
+        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN2_START_HOUR" "$WIN2_START_MIN" "$WIN2_END_HOUR" "$WIN2_END_MIN")")
         ;;
 esac
 
@@ -155,6 +393,10 @@ if ! command -v curl &>/dev/null; then
     echo -e "${R}✗ curl not found!${NC}"; exit 1
 fi
 echo -e "${G}✓${NC} curl"
+if ! command -v python3 &>/dev/null; then
+    echo -e "${R}✗ python3 not found!${NC}"; exit 1
+fi
+echo -e "${G}✓${NC} python3"
 
 mkdir -p "$OUT_DIR"
 echo -e "${G}✓${NC} Output dir ready"
@@ -166,7 +408,7 @@ echo ""
 echo -e "${B}─── Parsing Master Playlist ────────────────────────────────${NC}"
 echo -e "  ${D}Fetching ${MASTER_URL}${NC}"
 
-MASTER_CONTENT=$(curl -s "$MASTER_URL")
+MASTER_CONTENT=$(curl -fsSL -A "$HTTP_USER_AGENT" "$MASTER_URL" 2>/dev/null)
 if [ -z "$MASTER_CONTENT" ]; then
     echo -e "  ${R}✗ Failed to fetch master playlist${NC}"
     exit 1
@@ -263,7 +505,7 @@ echo ""
 
 # ── Probe the selected variant ──
 echo -e "${B}─── Stream Details (best variant) ──────────────────────────${NC}"
-PROBE_JSON=$(ffprobe -v quiet -print_format json -show_format -show_streams -i "$BEST_URL" 2>/dev/null)
+PROBE_JSON=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -print_format json -show_format -show_streams -i "$BEST_URL" 2>/dev/null)
 if [ -n "$PROBE_JSON" ]; then
     echo "$PROBE_JSON" | python3 -c "
 import sys, json
@@ -320,30 +562,45 @@ echo ""
 # ══════════════════════════════════════════════════════════
 echo -e "${BG_C} PHASE 1 ${NC}  ${B}Quality Test (${TEST_SEC}s)${NC}"
 echo ""
+if [ "$QUIET" -eq 1 ]; then
+    echo -e "  ${D}Running quality test capture...${NC}"
+fi
 
 TEST_FILE="${OUT_DIR}/_test.mp4"
-TLOG=$(mktemp /tmp/fftest.XXXXXX)
+TLOG=$(make_temp_file fftest)
+track_temp_file "$TEST_FILE"
+track_temp_file "$TLOG"
 
-ffmpeg -y -i "$BEST_URL" -t "$TEST_SEC" \
+ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$BEST_URL" -t "$TEST_SEC" \
     -c copy -movflags +faststart \
     -loglevel warning -stats \
     "$TEST_FILE" 2>"$TLOG" &
 TPID=$!
+track_pid "$TPID"
 SI=0; TS=$(date +%s)
 
 while kill -0 "$TPID" 2>/dev/null; do
-    E=$(( $(date +%s) - TS ))
-    R=$((TEST_SEC - E)); [ "$R" -lt 0 ] && R=0
-    PCT=$((E * 100 / TEST_SEC)); [ "$PCT" -gt 100 ] && PCT=100
-    [ -f "$TEST_FILE" ] && SZ=$(du -sh "$TEST_FILE" 2>/dev/null | cut -f1) || SZ="..."
-    BAR=$(draw_bar $PCT 25)
-    printf "\r  ${G}${SPIN[$SI]}${NC} TEST [${G}${BAR}${NC}] %3d%%  ${C}%02ds${NC}/${TEST_SEC}s  ${B}%s${NC}   " "$PCT" "$E" "$SZ"
-    SI=$(( (SI+1) % 10 )); sleep 1
+    if [ "$QUIET" -eq 0 ]; then
+        E=$(( $(date +%s) - TS ))
+        R=$((TEST_SEC - E)); [ "$R" -lt 0 ] && R=0
+        PCT=$((E * 100 / TEST_SEC)); [ "$PCT" -gt 100 ] && PCT=100
+        if TEST_BYTES=$(file_size_bytes "$TEST_FILE" 2>/dev/null); then
+            SZ=$(human_size "$TEST_BYTES")
+        else
+            SZ="..."
+        fi
+        BAR=$(draw_bar "$PCT" 25)
+        printf "\r  ${G}${SPIN[$SI]}${NC} TEST [${G}${BAR}${NC}] %3d%%  ${C}%02ds${NC}/${TEST_SEC}s  ${B}%s${NC}   " "$PCT" "$E" "$SZ"
+        SI=$(( (SI+1) % 10 ))
+    fi
+    sleep 1
 done
 
 wait "$TPID"; TEC=$?
+forget_pid "$TPID"
 rm -f "$TLOG"
-echo ""
+forget_temp_file "$TLOG"
+[ "$QUIET" -eq 0 ] && echo ""
 
 if [ "$TEC" -eq 0 ] && [ -f "$TEST_FILE" ]; then
     TB=$(wc -c < "$TEST_FILE" | tr -d ' ')
@@ -355,7 +612,7 @@ if [ "$TEC" -eq 0 ] && [ -f "$TEST_FILE" ]; then
             -show_entries stream=width,height,codec_name,profile \
             -of csv=p=0 "$TEST_FILE" 2>/dev/null)
         echo -e "  ${G}${B}✓ TEST PASSED${NC}"
-        echo -e "    Size:       $(human_size $TB)  (~${RATE} KB/s)"
+        echo -e "    Size:       $(human_size "$TB")  (~${RATE} KB/s)"
         echo -e "    Confirmed:  ${W}${TEST_RES}${NC}"
 
         # Quick validation
@@ -369,14 +626,17 @@ if [ "$TEC" -eq 0 ] && [ -f "$TEST_FILE" ]; then
         fi
 
         rm -f "$TEST_FILE"
+        forget_temp_file "$TEST_FILE"
     else
         echo -e "  ${R}${B}✗ TEST FAILED${NC} — file too small (${TB} bytes)"
         rm -f "$TEST_FILE"
+        forget_temp_file "$TEST_FILE"
         exit 1
     fi
 else
     echo -e "  ${R}${B}✗ TEST FAILED${NC} — ffmpeg exit code $TEC"
     rm -f "$TEST_FILE"
+    forget_temp_file "$TEST_FILE"
     exit 1
 fi
 
@@ -411,16 +671,21 @@ record_window() {
     echo ""
 
     # ── Wait for this window's start ──
+    WAIT_LOGGED=0
     while true; do
-        NH=$(date +%-H); NM=$(date +%-M); NS=$(date +%-S)
-        NOW=$((NH*3600 + NM*60 + NS))
+        NOW=$(now_seconds_of_day)
         [ "$NOW" -ge "$WIN_START_SEC" ] && break
         W=$((WIN_START_SEC - NOW))
-        printf "\r  ${Y}⏳ Recording at %02d:%02d — %02d:%02d remaining ...${NC}   " \
-            "$SH" "$SM" $((W/60)) $((W%60))
+        if [ "$QUIET" -eq 0 ]; then
+            printf "\r  ${Y}⏳ Recording at %02d:%02d — %02d:%02d remaining ...${NC}   " \
+                "$SH" "$SM" $((W/60)) $((W%60))
+        elif [ "$WAIT_LOGGED" -eq 0 ]; then
+            echo -e "  ${D}Waiting for recording window at $(printf '%02d:%02d' "$SH" "$SM")${NC}"
+            WAIT_LOGGED=1
+        fi
         sleep 1
     done
-    echo ""
+    [ "$QUIET" -eq 0 ] && echo ""
 
     echo -e "${BG_G} RECORD ${NC}  ${B}${NUM_SEGMENTS} × $(( SEGMENT_SEC/60 ))min segments  [1080p]${NC}"
     echo ""
@@ -432,8 +697,7 @@ record_window() {
 
         # For the last segment, cap duration to not overshoot the window
         local REMAINING_SEC
-        NH=$(date +%-H); NM=$(date +%-M); NS=$(date +%-S)
-        NOW=$((NH*3600 + NM*60 + NS))
+        NOW=$(now_seconds_of_day)
         REMAINING_SEC=$((WIN_END_SEC - NOW))
         local THIS_SEG_SEC=$SEGMENT_SEC
         if [ "$REMAINING_SEC" -lt "$SEGMENT_SEC" ] && [ "$REMAINING_SEC" -gt 0 ]; then
@@ -444,66 +708,108 @@ record_window() {
             break
         fi
 
-        SEG_FILE="${OUT_DIR}/segment_$(printf '%03d' $GLOBAL_SEG_NUM).mp4"
-        SRT_FILE="${OUT_DIR}/segment_$(printf '%03d' $GLOBAL_SEG_NUM).srt"
-        SEG_TS=$(date +%s)
+        SEG_FILE="${OUT_DIR}/segment_$(printf '%03d' "$GLOBAL_SEG_NUM").mp4"
+        SRT_FILE="${OUT_DIR}/segment_$(printf '%03d' "$GLOBAL_SEG_NUM").srt"
         SEG_CLOCK=$(date +%H:%M:%S)
 
-        echo -e "  ${BG_C} SEG $i/$NUM_SEGMENTS ${NC}  ${SEG_CLOCK}  →  segment_$(printf '%03d' $GLOBAL_SEG_NUM).mp4  (${THIS_SEG_SEC}s)"
+        echo -e "  ${BG_C} SEG $i/$NUM_SEGMENTS ${NC}  ${SEG_CLOCK}  →  segment_$(printf '%03d' "$GLOBAL_SEG_NUM").mp4  (${THIS_SEG_SEC}s)"
 
-        SLOG=$(mktemp /tmp/ffseg.XXXXXX)
+        ATTEMPT=1
+        VEC=1
+        while [ "$ATTEMPT" -le 2 ]; do
+            [ "$ATTEMPT" -gt 1 ] && echo -e "    ${Y}↻ Retry ${ATTEMPT}/2 in 5s after segment failure${NC}"
+            [ "$ATTEMPT" -gt 1 ] && sleep 5
+            [ "$ATTEMPT" -gt 1 ] && rm -f "$SEG_FILE" "$SRT_FILE"
 
-        # Main video
-        ffmpeg -y -i "$BEST_URL" -t "$THIS_SEG_SEC" \
-            -c:v copy -c:a copy \
-            -movflags +faststart -loglevel warning -stats \
-            "$SEG_FILE" 2>"$SLOG" &
-        VID_PID=$!
+            SEG_TS=$(date +%s)
+            SLOG=$(make_temp_file ffseg)
+            track_temp_file "$SLOG"
 
-        # CC extraction
-        CCLOG=$(mktemp /tmp/ffcc.XXXXXX)
-        ffmpeg -y -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
-            -map 0:s:0? -c:s srt -loglevel error \
-            "$SRT_FILE" 2>"$CCLOG" &
-        CC_PID=$!
+            # Main video
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$BEST_URL" -t "$THIS_SEG_SEC" \
+                -c:v copy -c:a copy \
+                -movflags +faststart -loglevel warning -stats \
+                "$SEG_FILE" 2>"$SLOG" &
+            VID_PID=$!
+            track_pid "$VID_PID"
+            STALL_MARKER=$(make_temp_file ffstall)
+            track_temp_file "$STALL_MARKER"
+            WATCHDOG_PID=$(start_timeout_watchdog "$VID_PID" "$((THIS_SEG_SEC * SEGMENT_TIMEOUT_MULTIPLIER))" "$STALL_MARKER")
+            track_pid "$WATCHDOG_PID"
 
-        SI=0
-        while kill -0 "$VID_PID" 2>/dev/null; do
-            E=$(( $(date +%s) - SEG_TS ))
-            R=$((THIS_SEG_SEC - E)); [ "$R" -lt 0 ] && R=0
-            PCT=$((E * 100 / THIS_SEG_SEC)); [ "$PCT" -gt 100 ] && PCT=100
+            # CC extraction
+            CCLOG=$(make_temp_file ffcc)
+            track_temp_file "$CCLOG"
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
+                -map 0:s:0? -c:s srt -loglevel error \
+                "$SRT_FILE" 2>"$CCLOG" &
+            CC_PID=$!
+            track_pid "$CC_PID"
 
-            GPCT=$(( ((i-1)*SEGMENT_SEC + E) * 100 / TOTAL_SEC ))
-            [ "$GPCT" -gt 100 ] && GPCT=100
+            SI=0
+            while kill -0 "$VID_PID" 2>/dev/null; do
+                if [ "$QUIET" -eq 0 ]; then
+                    E=$(( $(date +%s) - SEG_TS ))
+                    R=$((THIS_SEG_SEC - E)); [ "$R" -lt 0 ] && R=0
+                    PCT=$((E * 100 / THIS_SEG_SEC)); [ "$PCT" -gt 100 ] && PCT=100
 
-            [ -f "$SEG_FILE" ] && SZ=$(du -sh "$SEG_FILE" 2>/dev/null | cut -f1) || SZ="..."
+                    GPCT=$(( ((i-1)*SEGMENT_SEC + E) * 100 / TOTAL_SEC ))
+                    [ "$GPCT" -gt 100 ] && GPCT=100
 
-            BAR=$(draw_bar $PCT 25)
-            GBAR=$(draw_bar $GPCT 20)
+                    if SEG_BYTES=$(file_size_bytes "$SEG_FILE" 2>/dev/null); then
+                        SZ=$(human_size "$SEG_BYTES")
+                    else
+                        SZ="..."
+                    fi
 
-            printf "\r  ${G}${SPIN[$SI]}${NC} seg [${G}${BAR}${NC}] %3d%%  ${C}%d:%02d${NC}  ${B}%s${NC}  │  win [${Y}${GBAR}${NC}] %3d%%  " \
-                "$PCT" "$((E/60))" "$((E%60))" "$SZ" "$GPCT"
-            SI=$(( (SI+1) % 10 )); sleep 1
+                    BAR=$(draw_bar "$PCT" 25)
+                    GBAR=$(draw_bar "$GPCT" 20)
+
+                    printf "\r  ${G}${SPIN[$SI]}${NC} seg [${G}${BAR}${NC}] %3d%%  ${C}%d:%02d${NC}  ${B}%s${NC}  │  win [${Y}${GBAR}${NC}] %3d%%  " \
+                        "$PCT" "$((E/60))" "$((E%60))" "$SZ" "$GPCT"
+                    SI=$(( (SI+1) % 10 ))
+                fi
+                sleep 1
+            done
+
+            wait "$VID_PID"; VEC=$?
+            forget_pid "$VID_PID"
+            ATTEMPT_ELAPSED=$(( $(date +%s) - SEG_TS ))
+            stop_timeout_watchdog "$WATCHDOG_PID"
+
+            # Kill CC if stuck
+            ( sleep 8; kill "$CC_PID" 2>/dev/null ) &
+            KP=$!; wait "$CC_PID" 2>/dev/null
+            forget_pid "$CC_PID"
+            kill "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
+
+            rm -f "$SLOG" "$CCLOG"
+            forget_temp_file "$SLOG"
+            forget_temp_file "$CCLOG"
+            if [ -s "$STALL_MARKER" ]; then
+                echo -e "    ${Y}⚠ Segment stalled and hit the ${SEGMENT_TIMEOUT_MULTIPLIER}x timeout (${THIS_SEG_SEC}s → $((THIS_SEG_SEC * SEGMENT_TIMEOUT_MULTIPLIER))s)${NC}"
+            elif [ "$ATTEMPT_ELAPSED" -gt $((THIS_SEG_SEC + SLOW_SEGMENT_GRACE_SEC)) ]; then
+                echo -e "    ${Y}⚠ Segment ran ${ATTEMPT_ELAPSED}s for a ${THIS_SEG_SEC}s target${NC}"
+            fi
+            rm -f "$STALL_MARKER"
+            forget_temp_file "$STALL_MARKER"
+            [ "$QUIET" -eq 0 ] && echo ""
+
+            if [ "$VEC" -eq 0 ] && [ -f "$SEG_FILE" ]; then
+                break
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
         done
-
-        wait "$VID_PID"; VEC=$?
-
-        # Kill CC if stuck
-        ( sleep 8; kill "$CC_PID" 2>/dev/null ) &
-        KP=$!; wait "$CC_PID" 2>/dev/null
-        kill "$KP" 2>/dev/null; wait "$KP" 2>/dev/null
-
-        rm -f "$SLOG" "$CCLOG"
-        echo ""
 
         # Video result + resolution verification
         if [ "$VEC" -eq 0 ] && [ -f "$SEG_FILE" ]; then
             SB=$(wc -c < "$SEG_FILE" | tr -d ' ')
             TOTAL_SIZE=$((TOTAL_SIZE + SB))
             SEG_OK=$((SEG_OK + 1))
-            SEG_RES=$(ffprobe -v quiet -select_streams v:0 \
+            SEG_RES=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -select_streams v:0 \
                 -show_entries stream=width,height -of csv=p=0 "$SEG_FILE" 2>/dev/null)
-            echo -e "    ${G}✓${NC} Video  $(human_size $SB)  ${D}[${SEG_RES}]${NC}"
+            echo -e "    ${G}✓${NC} Video  $(human_size "$SB")  ${D}[${SEG_RES}]${NC}"
         else
             SEG_FAIL=$((SEG_FAIL + 1))
             echo -e "    ${R}✗${NC} Video failed (exit $VEC)"
@@ -514,7 +820,7 @@ record_window() {
             CB=$(wc -c < "$SRT_FILE" | tr -d ' ')
             if [ "$CB" -gt 10 ]; then
                 CC_FILES=$((CC_FILES + 1))
-                echo -e "    ${G}✓${NC} Captions  $(human_size $CB)"
+                echo -e "    ${G}✓${NC} Captions  $(human_size "$CB")"
             else
                 rm -f "$SRT_FILE"
                 echo -e "    ${D}─ No captions this segment${NC}"
@@ -531,7 +837,7 @@ record_window() {
     GRAND_SEG_FAIL=$((GRAND_SEG_FAIL + SEG_FAIL))
     GRAND_CC_FILES=$((GRAND_CC_FILES + CC_FILES))
 
-    echo -e "  ${G}✓ Window ${WIN_NUM} complete${NC} — ${SEG_OK} segments, $(human_size $TOTAL_SIZE)"
+    echo -e "  ${G}✓ Window ${WIN_NUM} complete${NC} — ${SEG_OK} segments, $(human_size "$TOTAL_SIZE")"
     echo ""
 }
 
@@ -554,7 +860,7 @@ echo ""
 echo -e "  ${B}Quality${NC}     1080p (highest variant)"
 echo -e "  ${B}Windows${NC}     ${NUM_WINDOWS}"
 echo -e "  ${B}Segments${NC}    ${G}${GRAND_SEG_OK} ok${NC}  ${R}${GRAND_SEG_FAIL} failed${NC}  /  ${GLOBAL_SEG_NUM} total"
-echo -e "  ${B}Total size${NC}  $(human_size $GRAND_TOTAL_SIZE)"
+echo -e "  ${B}Total size${NC}  $(human_size "$GRAND_TOTAL_SIZE")"
 echo -e "  ${B}Captions${NC}    ${GRAND_CC_FILES} .srt files"
 echo -e "  ${B}Duration${NC}    $(( ELAPSED_TOTAL/60 ))m $(( ELAPSED_TOTAL%60 ))s"
 echo -e "  ${B}Location${NC}    ${OUT_DIR}/"
@@ -563,10 +869,4 @@ echo -e "  ${B}Files:${NC}"
 ls -lh "$OUT_DIR"/ | tail -n +2 | while read line; do echo "    $line"; done
 echo ""
 
-if command -v open &>/dev/null; then
-    open "$OUT_DIR"
-    echo -e "  ${G}📂 Opened in Finder${NC}"
-elif command -v xdg-open &>/dev/null; then
-    xdg-open "$OUT_DIR" >/dev/null 2>&1 &
-    echo -e "  ${G}📂 Opened output folder${NC}"
-fi
+open_output_dir "$OUT_DIR"
