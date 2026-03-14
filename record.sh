@@ -14,6 +14,7 @@ OUT_DIR="${SCRIPT_DIR}/recording_$(date +%Y%m%d)"
 
 SEGMENT_SEC=300  # 5 minutes
 TEST_SEC=15
+MAX_DURATION_MIN=1440
 
 declare -a TEMP_FILES=()
 declare -a ACTIVE_PIDS=()
@@ -108,6 +109,41 @@ trap 'cleanup $?' EXIT
 trap 'cleanup 130; exit 130' INT
 trap 'cleanup 143; exit 143' TERM
 
+parse_time() {
+    local raw="$1"
+    local cleaned hour minute meridiem
+
+    cleaned=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    [ -z "$cleaned" ] && return 1
+
+    if [[ ! "$cleaned" =~ ^([0-9]{1,2})(:([0-9]{1,2}))?([ap]m)?$ ]]; then
+        return 1
+    fi
+
+    hour=$((10#${BASH_REMATCH[1]}))
+    minute=$((10#${BASH_REMATCH[3]:-0}))
+    meridiem="${BASH_REMATCH[4]:-}"
+
+    if [ "$minute" -gt 59 ]; then
+        return 1
+    fi
+
+    if [ -n "$meridiem" ]; then
+        if [ "$hour" -lt 1 ] || [ "$hour" -gt 12 ]; then
+            return 1
+        fi
+        if [ "$meridiem" = "am" ] && [ "$hour" -eq 12 ]; then
+            hour=0
+        elif [ "$meridiem" = "pm" ] && [ "$hour" -lt 12 ]; then
+            hour=$((hour + 12))
+        fi
+    elif [ "$hour" -gt 23 ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$((hour * 3600 + minute * 60))"
+}
+
 # ══════════════════════════════════════════════════════════
 # MODE SELECTION
 # ══════════════════════════════════════════════════════════
@@ -135,12 +171,18 @@ declare -a WIN_LABELS=()   # display labels
 case "$MODE_CHOICE" in
     2)
         read -rp "  How many minutes to record? " CUSTOM_MINS
-        if ! [[ "$CUSTOM_MINS" =~ ^[0-9]+$ ]] || [ "$CUSTOM_MINS" -lt 1 ]; then
-            echo -e "  ${R}✗ Invalid duration${NC}"; exit 1
+        if ! [[ "$CUSTOM_MINS" =~ ^[0-9]+$ ]]; then
+            echo -e "  ${R}✗ Duration must be a whole number of minutes${NC}"; exit 1
         fi
-        NH=$(date +%-H); NM=$(date +%-M)
-        NOW_SEC=$((NH*3600 + NM*60))
+        if [ "$CUSTOM_MINS" -lt 1 ] || [ "$CUSTOM_MINS" -gt "$MAX_DURATION_MIN" ]; then
+            echo -e "  ${R}✗ Duration must be between 1 and ${MAX_DURATION_MIN} minutes${NC}"; exit 1
+        fi
+        NH=$(date +%H); NM=$(date +%M)
+        NOW_SEC=$((10#$NH*3600 + 10#$NM*60))
         END_SEC=$((NOW_SEC + CUSTOM_MINS*60))
+        if [ "$END_SEC" -gt 86400 ]; then
+            echo -e "  ${R}✗ Record-now duration cannot cross midnight${NC}"; exit 1
+        fi
         WIN_STARTS+=("$NOW_SEC")
         WIN_ENDS+=("$END_SEC")
         WIN_LABELS+=("Now → +${CUSTOM_MINS}min")
@@ -150,28 +192,12 @@ case "$MODE_CHOICE" in
         echo ""
         read -rp "  Start time: " RAW_START
         read -rp "  End time:   " RAW_END
-
-        parse_time() {
-            local raw="$1"
-            local h m pm=0
-            # Strip spaces
-            raw=$(echo "$raw" | tr -d ' ')
-            # Check for am/pm
-            if echo "$raw" | grep -iq 'pm'; then pm=1; fi
-            if echo "$raw" | grep -iq 'am'; then pm=0; fi
-            raw=$(echo "$raw" | sed 's/[aApPmM]//g')
-            h=$(echo "$raw" | cut -d: -f1)
-            m=$(echo "$raw" | cut -d: -f2 2>/dev/null)
-            [ -z "$m" ] && m=0
-            # Remove leading zeros for arithmetic
-            h=$((10#$h)); m=$((10#$m))
-            if [ "$pm" -eq 1 ] && [ "$h" -lt 12 ]; then h=$((h+12)); fi
-            if [ "$pm" -eq 0 ] && [ "$h" -eq 12 ]; then h=0; fi
-            echo $((h*3600 + m*60))
-        }
-
-        S=$(parse_time "$RAW_START")
-        E=$(parse_time "$RAW_END")
+        if ! S=$(parse_time "$RAW_START"); then
+            echo -e "  ${R}✗ Invalid start time${NC}"; exit 1
+        fi
+        if ! E=$(parse_time "$RAW_END"); then
+            echo -e "  ${R}✗ Invalid end time${NC}"; exit 1
+        fi
         if [ "$E" -le "$S" ]; then
             echo -e "  ${R}✗ End time must be after start time${NC}"; exit 1
         fi
@@ -179,17 +205,17 @@ case "$MODE_CHOICE" in
         EH=$((E/3600)); EM=$(( (E%3600)/60 ))
         WIN_STARTS+=("$S")
         WIN_ENDS+=("$E")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' $SH $SM $EH $EM)")
+        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$SH" "$SM" "$EH" "$EM")")
         ;;
     *)
         # Default: scheduled windows
         WIN_STARTS+=("$((WIN1_START_HOUR*3600 + WIN1_START_MIN*60))")
         WIN_ENDS+=("$((WIN1_END_HOUR*3600 + WIN1_END_MIN*60))")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' $WIN1_START_HOUR $WIN1_START_MIN $WIN1_END_HOUR $WIN1_END_MIN)")
+        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN1_START_HOUR" "$WIN1_START_MIN" "$WIN1_END_HOUR" "$WIN1_END_MIN")")
 
         WIN_STARTS+=("$((WIN2_START_HOUR*3600 + WIN2_START_MIN*60))")
         WIN_ENDS+=("$((WIN2_END_HOUR*3600 + WIN2_END_MIN*60))")
-        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' $WIN2_START_HOUR $WIN2_START_MIN $WIN2_END_HOUR $WIN2_END_MIN)")
+        WIN_LABELS+=("$(printf '%02d:%02d → %02d:%02d' "$WIN2_START_HOUR" "$WIN2_START_MIN" "$WIN2_END_HOUR" "$WIN2_END_MIN")")
         ;;
 esac
 
@@ -216,6 +242,10 @@ if ! command -v curl &>/dev/null; then
     echo -e "${R}✗ curl not found!${NC}"; exit 1
 fi
 echo -e "${G}✓${NC} curl"
+if ! command -v python3 &>/dev/null; then
+    echo -e "${R}✗ python3 not found!${NC}"; exit 1
+fi
+echo -e "${G}✓${NC} python3"
 
 mkdir -p "$OUT_DIR"
 echo -e "${G}✓${NC} Output dir ready"
@@ -421,7 +451,7 @@ if [ "$TEC" -eq 0 ] && [ -f "$TEST_FILE" ]; then
             -show_entries stream=width,height,codec_name,profile \
             -of csv=p=0 "$TEST_FILE" 2>/dev/null)
         echo -e "  ${G}${B}✓ TEST PASSED${NC}"
-        echo -e "    Size:       $(human_size $TB)  (~${RATE} KB/s)"
+        echo -e "    Size:       $(human_size "$TB")  (~${RATE} KB/s)"
         echo -e "    Confirmed:  ${W}${TEST_RES}${NC}"
 
         # Quick validation
@@ -513,11 +543,11 @@ record_window() {
             break
         fi
 
-        SEG_FILE="${OUT_DIR}/segment_$(printf '%03d' $GLOBAL_SEG_NUM).mp4"
-        SRT_FILE="${OUT_DIR}/segment_$(printf '%03d' $GLOBAL_SEG_NUM).srt"
+        SEG_FILE="${OUT_DIR}/segment_$(printf '%03d' "$GLOBAL_SEG_NUM").mp4"
+        SRT_FILE="${OUT_DIR}/segment_$(printf '%03d' "$GLOBAL_SEG_NUM").srt"
         SEG_CLOCK=$(date +%H:%M:%S)
 
-        echo -e "  ${BG_C} SEG $i/$NUM_SEGMENTS ${NC}  ${SEG_CLOCK}  →  segment_$(printf '%03d' $GLOBAL_SEG_NUM).mp4  (${THIS_SEG_SEC}s)"
+        echo -e "  ${BG_C} SEG $i/$NUM_SEGMENTS ${NC}  ${SEG_CLOCK}  →  segment_$(printf '%03d' "$GLOBAL_SEG_NUM").mp4  (${THIS_SEG_SEC}s)"
 
         ATTEMPT=1
         VEC=1
@@ -594,7 +624,7 @@ record_window() {
             SEG_OK=$((SEG_OK + 1))
             SEG_RES=$(ffprobe -v quiet -select_streams v:0 \
                 -show_entries stream=width,height -of csv=p=0 "$SEG_FILE" 2>/dev/null)
-            echo -e "    ${G}✓${NC} Video  $(human_size $SB)  ${D}[${SEG_RES}]${NC}"
+            echo -e "    ${G}✓${NC} Video  $(human_size "$SB")  ${D}[${SEG_RES}]${NC}"
         else
             SEG_FAIL=$((SEG_FAIL + 1))
             echo -e "    ${R}✗${NC} Video failed (exit $VEC)"
@@ -605,7 +635,7 @@ record_window() {
             CB=$(wc -c < "$SRT_FILE" | tr -d ' ')
             if [ "$CB" -gt 10 ]; then
                 CC_FILES=$((CC_FILES + 1))
-                echo -e "    ${G}✓${NC} Captions  $(human_size $CB)"
+                echo -e "    ${G}✓${NC} Captions  $(human_size "$CB")"
             else
                 rm -f "$SRT_FILE"
                 echo -e "    ${D}─ No captions this segment${NC}"
@@ -622,7 +652,7 @@ record_window() {
     GRAND_SEG_FAIL=$((GRAND_SEG_FAIL + SEG_FAIL))
     GRAND_CC_FILES=$((GRAND_CC_FILES + CC_FILES))
 
-    echo -e "  ${G}✓ Window ${WIN_NUM} complete${NC} — ${SEG_OK} segments, $(human_size $TOTAL_SIZE)"
+    echo -e "  ${G}✓ Window ${WIN_NUM} complete${NC} — ${SEG_OK} segments, $(human_size "$TOTAL_SIZE")"
     echo ""
 }
 
@@ -645,7 +675,7 @@ echo ""
 echo -e "  ${B}Quality${NC}     1080p (highest variant)"
 echo -e "  ${B}Windows${NC}     ${NUM_WINDOWS}"
 echo -e "  ${B}Segments${NC}    ${G}${GRAND_SEG_OK} ok${NC}  ${R}${GRAND_SEG_FAIL} failed${NC}  /  ${GLOBAL_SEG_NUM} total"
-echo -e "  ${B}Total size${NC}  $(human_size $GRAND_TOTAL_SIZE)"
+echo -e "  ${B}Total size${NC}  $(human_size "$GRAND_TOTAL_SIZE")"
 echo -e "  ${B}Captions${NC}    ${GRAND_CC_FILES} .srt files"
 echo -e "  ${B}Duration${NC}    $(( ELAPSED_TOTAL/60 ))m $(( ELAPSED_TOTAL%60 ))s"
 echo -e "  ${B}Location${NC}    ${OUT_DIR}/"
