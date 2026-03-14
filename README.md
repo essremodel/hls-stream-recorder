@@ -127,6 +127,12 @@ WIN2_END_HOUR=23;   WIN2_END_MIN=0      # 11:00 PM
 
 You can also override the output folder at runtime with `--output /path/to/folder`.
 
+If a provider is strict about request headers, you can override the default HTTP User-Agent:
+
+```bash
+HLS_RECORDER_USER_AGENT="Mozilla/5.0 Custom Client" ./record.sh https://your-stream.com/index.m3u8
+```
+
 ## Output
 
 Files are saved to a date-stamped folder next to the script:
@@ -194,6 +200,8 @@ If a segment needs intervention, you may also see lines like:
 
 - Verify that the URL points to the HLS master playlist, not a web page.
 - Some providers rotate or expire playlist URLs. Refresh the source URL and try again.
+- The recorder follows redirects automatically and sends a browser-like User-Agent by default.
+- If the provider still blocks requests, try setting `HLS_RECORDER_USER_AGENT` to match a browser UA string you know works.
 - Test the playlist directly with `curl -I` or `ffprobe` to confirm it still resolves.
 
 ### `ffmpeg` hangs or a segment times out

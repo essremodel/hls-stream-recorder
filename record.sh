@@ -10,6 +10,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULT_MASTER_URL="https://example.com/stream/index.m3u8"
+HTTP_USER_AGENT="${HLS_RECORDER_USER_AGENT:-Mozilla/5.0 (HLS Stream Recorder)}"
 MASTER_URL=""
 OUT_DIR=""
 OUTPUT_OVERRIDE=""
@@ -407,7 +408,7 @@ echo ""
 echo -e "${B}─── Parsing Master Playlist ────────────────────────────────${NC}"
 echo -e "  ${D}Fetching ${MASTER_URL}${NC}"
 
-MASTER_CONTENT=$(curl -s "$MASTER_URL")
+MASTER_CONTENT=$(curl -fsSL -A "$HTTP_USER_AGENT" "$MASTER_URL" 2>/dev/null)
 if [ -z "$MASTER_CONTENT" ]; then
     echo -e "  ${R}✗ Failed to fetch master playlist${NC}"
     exit 1
@@ -504,7 +505,7 @@ echo ""
 
 # ── Probe the selected variant ──
 echo -e "${B}─── Stream Details (best variant) ──────────────────────────${NC}"
-PROBE_JSON=$(ffprobe -v quiet -print_format json -show_format -show_streams -i "$BEST_URL" 2>/dev/null)
+PROBE_JSON=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -print_format json -show_format -show_streams -i "$BEST_URL" 2>/dev/null)
 if [ -n "$PROBE_JSON" ]; then
     echo "$PROBE_JSON" | python3 -c "
 import sys, json
@@ -570,7 +571,7 @@ TLOG=$(make_temp_file fftest)
 track_temp_file "$TEST_FILE"
 track_temp_file "$TLOG"
 
-ffmpeg -y -i "$BEST_URL" -t "$TEST_SEC" \
+ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$BEST_URL" -t "$TEST_SEC" \
     -c copy -movflags +faststart \
     -loglevel warning -stats \
     "$TEST_FILE" 2>"$TLOG" &
@@ -725,7 +726,7 @@ record_window() {
             track_temp_file "$SLOG"
 
             # Main video
-            ffmpeg -y -i "$BEST_URL" -t "$THIS_SEG_SEC" \
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$BEST_URL" -t "$THIS_SEG_SEC" \
                 -c:v copy -c:a copy \
                 -movflags +faststart -loglevel warning -stats \
                 "$SEG_FILE" 2>"$SLOG" &
@@ -739,7 +740,7 @@ record_window() {
             # CC extraction
             CCLOG=$(make_temp_file ffcc)
             track_temp_file "$CCLOG"
-            ffmpeg -y -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
+            ffmpeg -y -user_agent "$HTTP_USER_AGENT" -i "$MASTER_URL" -t "$THIS_SEG_SEC" \
                 -map 0:s:0? -c:s srt -loglevel error \
                 "$SRT_FILE" 2>"$CCLOG" &
             CC_PID=$!
@@ -806,7 +807,7 @@ record_window() {
             SB=$(wc -c < "$SEG_FILE" | tr -d ' ')
             TOTAL_SIZE=$((TOTAL_SIZE + SB))
             SEG_OK=$((SEG_OK + 1))
-            SEG_RES=$(ffprobe -v quiet -select_streams v:0 \
+            SEG_RES=$(ffprobe -user_agent "$HTTP_USER_AGENT" -v quiet -select_streams v:0 \
                 -show_entries stream=width,height -of csv=p=0 "$SEG_FILE" 2>/dev/null)
             echo -e "    ${G}✓${NC} Video  $(human_size "$SB")  ${D}[${SEG_RES}]${NC}"
         else

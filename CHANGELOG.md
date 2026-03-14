@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Added validation to reject invalid durations, malformed times, and record-now durations that would cross midnight.
 - Replaced several platform-specific shell idioms with more portable helpers for progress bars, temp files, current time, and output-folder opening.
 - Quiet mode now suppresses progress animations while keeping start/end log lines and summaries.
+- Playlist fetches now follow redirects and send a configurable HTTP User-Agent for HLS endpoints that reject default clients.
 
 ### Fixed
 
