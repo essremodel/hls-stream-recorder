@@ -9,6 +9,7 @@ declare -a CHANNEL_SHORTS=()
 declare -a CHANNEL_NAMES=()
 declare -a CHANNEL_URLS=()
 declare -a CHANNEL_NOTES=()
+declare -a CHANNEL_NOTE_TOKENS=()
 declare -a CHANNEL_SOURCES=()
 declare -A CHANNEL_CATEGORY_COUNTS=()
 declare -A CHANNEL_INDEX_BY_SHORT=()
@@ -36,25 +37,74 @@ channels_short_key() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+channels_split_notes() {
+    local notes="$1"
+    local current=""
+    local quote=""
+    local char
+    local idx
+
+    CHANNEL_NOTE_TOKENS=()
+
+    for (( idx=0; idx<${#notes}; idx++ )); do
+        char="${notes:idx:1}"
+
+        if [ -n "$quote" ]; then
+            if [ "$char" = "\\" ] && [ $((idx + 1)) -lt ${#notes} ]; then
+                idx=$((idx + 1))
+                current+="${notes:idx:1}"
+            elif [ "$char" = "$quote" ]; then
+                quote=""
+            else
+                current+="$char"
+            fi
+            continue
+        fi
+
+        case "$char" in
+            ';')
+                current="$(channels_trim "$current")"
+                [ -n "$current" ] && CHANNEL_NOTE_TOKENS+=("$current")
+                current=""
+                ;;
+            '"')
+                quote='"'
+                ;;
+            "'")
+                quote="'"
+                ;;
+            '\\')
+                if [ $((idx + 1)) -lt ${#notes} ]; then
+                    idx=$((idx + 1))
+                    current+="${notes:idx:1}"
+                fi
+                ;;
+            *)
+                current+="$char"
+                ;;
+        esac
+    done
+
+    current="$(channels_trim "$current")"
+    [ -n "$current" ] && CHANNEL_NOTE_TOKENS+=("$current")
+}
+
 channels_user_agent_from_notes() {
     local notes="$1"
     local token
     local ua_value
-    local old_ifs="$IFS"
 
-    IFS=';'
-    for token in $notes; do
-        token="$(channels_trim "$token")"
+    channels_split_notes "$notes"
+    for token in "${CHANNEL_NOTE_TOKENS[@]}"; do
         case "$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')" in
             ua=*|user-agent=*)
-                ua_value="${token#*=}"
-                channels_trim "$ua_value"
-                IFS="$old_ifs"
+                ua_value="$(channels_trim "${token#*=}")"
+                [ -n "$ua_value" ] || return 1
+                printf '%s' "$ua_value"
                 return 0
                 ;;
         esac
     done
-    IFS="$old_ifs"
     return 1
 }
 
@@ -63,11 +113,8 @@ channels_notes_display() {
     local cleaned=()
     local token
     local idx
-    local old_ifs="$IFS"
-
-    IFS=';'
-    for token in $notes; do
-        token="$(channels_trim "$token")"
+    channels_split_notes "$notes"
+    for token in "${CHANNEL_NOTE_TOKENS[@]}"; do
         case "$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')" in
             ua=*|user-agent=*)
                 ;;
@@ -76,7 +123,6 @@ channels_notes_display() {
                 ;;
         esac
     done
-    IFS="$old_ifs"
 
     if [ "${#cleaned[@]}" -eq 0 ]; then
         return 1

@@ -712,6 +712,7 @@ run_stream_probe_batch() {
 
     python3 - <<'PY' "$input_file" "$STREAM_TEST_TIMEOUT_SEC" "$STREAM_TEST_TOTAL_TIMEOUT_SEC" "$STREAM_TEST_MAX_PARALLEL"
 import json
+import math
 import subprocess
 import sys
 import time
@@ -774,6 +775,11 @@ with open(input_path, "r", encoding="utf-8") as handle:
             continue
         idx, url, user_agent = line.split("\t")
         entries.append((int(idx), url, user_agent))
+
+if max_parallel < 1:
+    max_parallel = 1
+minimum_total_timeout = per_timeout * max(1, math.ceil(len(entries) / max_parallel)) + 2.0
+total_timeout = max(total_timeout, minimum_total_timeout)
 
 pending = list(entries)
 running = {}
@@ -853,6 +859,9 @@ test_all_streams() {
     local input_file
     local result_file
     local idx
+    local pending_count=0
+    local probe_batches=0
+    local estimated_sec=0
     local online_count=0
     local offline_count=0
     local status resolution bitrate error summary detail
@@ -871,6 +880,7 @@ test_all_streams() {
     : > "$input_file"
     for (( idx=0; idx<${#CHANNEL_SHORTS[@]}; idx++ )); do
         if [ -z "${STREAM_HEALTH_STATUS[$idx]:-}" ]; then
+            pending_count=$((pending_count + 1))
             if ua=$(channels_user_agent_from_notes "${CHANNEL_NOTES[$idx]}" 2>/dev/null); then
                 printf '%s\t%s\t%s\n' "$idx" "${CHANNEL_URLS[$idx]}" "$ua" >> "$input_file"
             else
@@ -881,7 +891,9 @@ test_all_streams() {
 
     echo ""
     if [ -s "$input_file" ]; then
-        echo -e "  ${D}Testing all streams... (this takes ~15 seconds)${NC}"
+        probe_batches=$(((pending_count + STREAM_TEST_MAX_PARALLEL - 1) / STREAM_TEST_MAX_PARALLEL))
+        estimated_sec=$((probe_batches * STREAM_TEST_TIMEOUT_SEC))
+        echo -e "  ${D}Testing all streams... (up to ~${estimated_sec}s if several are slow to respond)${NC}"
         run_stream_probe_batch "$input_file" > "$result_file"
         while IFS=$'\t' read -r idx status resolution bitrate error summary; do
             cache_stream_health_result "$idx" "${status}	${resolution}	${bitrate}	${error}	${summary}"

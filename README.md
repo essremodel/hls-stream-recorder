@@ -105,7 +105,7 @@ Manual URLs, built-in channels, and custom streams are quick-probed before the m
 ./record.sh --test-streams
 ```
 
-This runs up to 5 probes in parallel, caches results for the current session, and reports online/offline status with resolution and bitrate when available.
+This runs up to 5 probes in parallel, caches results for the current session, and reports online/offline status with resolution and bitrate when available. A full pass can take longer when several endpoints are slow or timing out.
 
 After stream selection you'll see the recording mode menu:
 
@@ -167,10 +167,10 @@ Category|short_name|Display Name|https://url/master.m3u8|Optional notes
 
 Use `streams.txt` for personal streams instead of editing `channels.conf`.
 
-If a stream needs a custom User-Agent, add it in the notes field:
+If a stream needs a custom User-Agent, add it in the notes field. Quote the value when it contains semicolons:
 
 ```text
-My Streams|strict-feed|Strict Feed|https://example.com/live.m3u8|user-agent=Mozilla/5.0 Custom Client; Requires desktop UA
+My Streams|strict-feed|Strict Feed|https://example.com/live.m3u8|user-agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"; Requires desktop UA
 ```
 
 ## Channel Sources
