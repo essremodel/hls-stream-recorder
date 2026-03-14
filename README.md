@@ -15,8 +15,11 @@ A bash script that records HLS live streams at the highest available bitrate. Au
   - **Record Now (duration)** — start immediately for N minutes
   - **Record Now (time range)** — specify custom start/end times (12h or 24h format)
 - **5-minute segments** — fault-tolerant chunking so a stream hiccup doesn't lose everything
+- **Automatic retry** — retries a failed segment once after a short pause
+- **Stall protection** — kills a segment attempt that runs for more than 2x its target duration
 - **Closed captions** — attempts `.srt` extraction per segment
 - **Live progress UI** — animated spinners, progress bars, file sizes, per-segment and overall progress
+- **CLI flags** — supports `--help`, `--quiet`, `--url`, and `--output`
 - **Detailed stream probe** — displays codec, resolution, FPS, color space, bitrate before recording
 
 ## Requirements
@@ -32,10 +35,27 @@ A bash script that records HLS live streams at the highest available bitrate. Au
 
 ```bash
 chmod +x record.sh
-./record.sh https://your-stream.com/index.m3u8
+./record.sh --url https://your-stream.com/index.m3u8
 ```
 
-Pass the HLS master playlist URL as the first argument. If you prefer, you can edit the default `MASTER_URL` placeholder near the top of `record.sh` instead.
+Pass the HLS master playlist URL either as the first argument or with `--url`. If you prefer, you can edit the default `MASTER_URL` placeholder near the top of `record.sh` instead.
+
+### CLI Flags
+
+| Flag | Description |
+|------|-------------|
+| `-h`, `--help` | Show usage and exit |
+| `-q`, `--quiet` | Suppress progress animations and countdown redraws |
+| `--url <url>` | Set the HLS master playlist URL |
+| `--output <dir>` | Write recordings to a custom output directory |
+
+### Examples
+
+```bash
+./record.sh https://your-stream.com/index.m3u8
+./record.sh --url https://your-stream.com/index.m3u8 --output /tmp/hls-capture
+echo 1 | ./record.sh --quiet https://your-stream.com/index.m3u8
+```
 
 On launch you'll see a mode selection menu:
 
@@ -105,6 +125,8 @@ WIN2_START_HOUR=21; WIN2_START_MIN=55   # 9:55 PM
 WIN2_END_HOUR=23;   WIN2_END_MIN=0      # 11:00 PM
 ```
 
+You can also override the output folder at runtime with `--output /path/to/folder`.
+
 ## Output
 
 Files are saved to a date-stamped folder next to the script:
@@ -118,7 +140,7 @@ recording_20260313/
 ├── ...
 ```
 
-On macOS, the output folder opens automatically in Finder when recording completes. On Linux, the script uses `xdg-open` when available.
+On macOS, the output folder opens automatically in Finder when recording completes. On Linux, the script uses `xdg-open` when available in a GUI session.
 
 ### Summary
 
@@ -138,6 +160,13 @@ After all windows finish, you get a full report:
   Location    /path/to/recording_20260313/
 ```
 
+If a segment needs intervention, you may also see lines like:
+
+```text
+    ↻ Retry 2/2 in 5s after segment failure
+    ⚠ Segment stalled and hit the 2x timeout (300s → 600s)
+```
+
 ## How It Works
 
 1. **Fetch & parse** the master `.m3u8` playlist
@@ -146,16 +175,44 @@ After all windows finish, you get a full report:
 4. **Test** — record 15 seconds, verify file size and resolution
 5. **Wait** for the scheduled start time (or start immediately in on-demand mode)
 6. **Record** in 5-minute segments using `ffmpeg -c copy` (no re-encoding)
-7. **Extract captions** in parallel from the master URL
-8. **Repeat** for each recording window
-9. **Summarize** and open the output folder
+7. **Retry** a failed segment once after a 5-second pause
+8. **Enforce a timeout** if a segment stalls far beyond its target duration
+9. **Extract captions** in parallel from the master URL
+10. **Repeat** for each recording window
+11. **Summarize** and open the output folder
 
 ## Tips
 
 - **Segment duration** — 5 minutes is a good balance between fault tolerance and file count. Increase `SEGMENT_SEC` for fewer, larger files.
 - **Adding more windows** — add `WIN3_*` variables and append them to the arrays in the scheduled-mode case block.
-- **Cron/launchd** — to run unattended, pipe `1` into stdin: `echo 1 | ./record.sh https://your-stream.com/index.m3u8` and it will use scheduled mode with no interaction.
+- **Cron/launchd** — to run unattended, pipe `1` into stdin: `echo 1 | ./record.sh --quiet https://your-stream.com/index.m3u8` and it will use scheduled mode with no interaction.
 - **Disk space** — a 1080p HLS stream typically runs 3–6 GB/hour depending on bitrate. Plan accordingly for multi-hour recordings.
+
+## Troubleshooting
+
+### Stream playlist fails to load
+
+- Verify that the URL points to the HLS master playlist, not a web page.
+- Some providers rotate or expire playlist URLs. Refresh the source URL and try again.
+- Test the playlist directly with `curl -I` or `ffprobe` to confirm it still resolves.
+
+### `ffmpeg` hangs or a segment times out
+
+- The recorder now kills a segment attempt if it runs for more than 2x the requested segment length.
+- If this happens repeatedly, the upstream stream may be unstable or the selected URL may no longer be valid.
+- Try a shorter recording window first to confirm the stream is still healthy.
+
+### Recording stops because the disk fills up
+
+- Check available disk space before long runs.
+- Use `--output` to target a volume with more free space.
+- Delete old `recording_*` folders and large `.mp4` files you no longer need.
+
+## Contributing
+
+- Keep changes incremental and avoid rewriting the capture flow unless a bug requires it.
+- Run `bash -n record.sh` before opening a pull request.
+- Update `README.md` and `CHANGELOG.md` when behavior or CLI flags change.
 
 ## License
 
