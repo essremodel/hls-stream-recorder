@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `fox31` channel entry for FOX 31 Denver (KDVR) via a third-party iptv-org rebroadcast, with a quoted `ua=` note supplying the browser User-Agent the endpoint requires, plus a README "Station Notes" section documenting the capture gotchas found during the 2026-07-29 aircheck (master-vs-variant handling, `-reconnect_at_eof` zero-byte failure, MPEG-TS acquisition, preflight checklist).
+- README guidance on the KDVR/KWGN duopoly: `kdvr.com` serves both stations, so a show's page URL does not identify its network. Records that Great Day Colorado airs on KWGN/CW2 (not FOX31), that no lawful public KWGN stream is available, and that neither accessible feed has a usable DVR window (~20 s rebroadcaster, ~120 s CW2+ player) — so a target airing must be recorded live on the correct channel. Preflight now requires confirming the on-screen *programming*, not just the station bug.
 - Built-in stream selection via `channels.conf`, including a category-grouped interactive picker and CLI shortcuts with `--stream`.
 - `channels.sh` as the sourceable channel-catalog loader used by the picker.
 - `streams.example.txt` as a committed template for personal streams and a gitignored local `streams.txt` workflow.
