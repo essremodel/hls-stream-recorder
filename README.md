@@ -343,9 +343,20 @@ If a segment needs intervention, you may also see lines like:
 - **Monitor mode** — for long runs, point `--output` at a disk with plenty of free space and keep `monitor.log` under review for CC warnings.
 - **Disk space** — a 1080p HLS stream typically runs 3–6 GB/hour depending on bitrate. Plan accordingly for multi-hour recordings.
 
-## Troubleshooting
+## Station Notes
 
-### Stream playlist fails to load
+### FOX 31 Denver / KDVR (`fox31`)
+
+The `fox31` entry uses a **third-party rebroadcast** from the public [iptv-org](https://github.com/iptv-org/iptv) directory (`stream.cammonitorplus.net`), not KDVR's own CDN — KDVR does not publish a direct public HLS URL, and `kdvr.com` serves a bot wall (HTTP 403) to non-browser clients. Lessons from the 2026-07-29 Great Day Colorado aircheck capture:
+
+- **A real browser User-Agent is required.** The entry carries it via a quoted `ua=` note; ffmpeg's default UA can stall on the master playlist. If capturing manually, pass the same string with `-user_agent`.
+- **Give ffmpeg the master playlist** (`/1768/index.m3u8`) so variant parsing works; the recorder resolves the variant (`tracks-v1a1/mono.m3u8`) from it. Handing the variant URL directly to `record.sh` fails its variant scan.
+- **Do not use `-reconnect_at_eof 1`** on this stream in manual captures — observed to make ffmpeg loop on EOF and write zero bytes while the process stays alive. `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` is sufficient.
+- **Record to MPEG-TS during acquisition** for anything that matters. TS has no finalization step, so a killed process still leaves a playable file; remux to MP4 afterwards if needed.
+- **Preflight before a critical window:** fetch the master with `curl -A "<browser UA>"` and confirm `#EXT-X-PROGRAM-DATE-TIME` tracks the current wall-clock; capture ~10 s, then decode a frame and confirm the FOX 31/KDVR bug on screen. Verify the output file grows between two checks ~30 s after starting.
+- **Caveats:** the feed is 1024x576 (not full HD), unauthenticated, and can drop or disappear without notice — fine for airchecks and proof-of-airing, not a broadcast master. For broadcast-quality copies, request the file from the station.
+
+
 
 - Verify that the URL points to the HLS master playlist, not a web page.
 - Some providers rotate or expire playlist URLs. Refresh the source URL and try again.

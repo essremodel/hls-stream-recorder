@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `fox31` channel entry for FOX 31 Denver (KDVR) via a third-party iptv-org rebroadcast, with a quoted `ua=` note supplying the browser User-Agent the endpoint requires, plus a README "Station Notes" section documenting the capture gotchas found during the 2026-07-29 aircheck (master-vs-variant handling, `-reconnect_at_eof` zero-byte failure, MPEG-TS acquisition, preflight checklist).
 - Built-in stream selection via `channels.conf`, including a category-grouped interactive picker and CLI shortcuts with `--stream`.
 - `channels.sh` as the sourceable channel-catalog loader used by the picker.
 - `streams.example.txt` as a committed template for personal streams and a gitignored local `streams.txt` workflow.
