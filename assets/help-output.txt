@@ -1,0 +1,32 @@
+Usage: record.sh [options] [url]
+
+Record an HLS stream at the highest available quality.
+
+Options:
+  -h, --help          Show this help text and exit
+  -q, --quiet         Suppress progress animations
+      --stream SEL    Use stream SEL by number or short name (e.g. 1, cbs4)
+      --test-streams  Probe built-in/custom streams and report which are live
+      --update-channels
+                      Coming soon; for now edit channels.conf manually
+      --mode N        Skip the mode prompt and use mode 1, 2, 3, or 4
+      --monitor       Enable keyword monitor mode (experimental)
+      --keywords FILE Use FILE for monitor keywords (default: keywords.txt)
+      --until TIME    Stop monitor mode at TIME (e.g. 23:00)
+      --segment-length SEC
+                      Use SEC-second segments for monitor mode (default: 150)
+      --url URL       Use URL as the HLS master playlist
+      --output DIR    Write recordings to DIR
+
+Arguments:
+  url                 HLS master playlist URL (same as --url)
+
+Examples:
+  record.sh
+  record.sh --stream cbs4
+  record.sh --stream 1 --mode 2
+  record.sh --test-streams
+  record.sh https://your-stream.com/index.m3u8
+  record.sh --url https://your-stream.com/index.m3u8 --output /tmp/capture
+  echo 1 | record.sh --quiet https://your-stream.com/index.m3u8
+  record.sh --stream abc --monitor --keywords ./keywords.txt --until 23:00

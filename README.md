@@ -1,10 +1,40 @@
-# 📡 HLS Stream Recorder — Max Quality
+<div align="center">
+
+<img src="./assets/hero.png" alt="HLS Stream Recorder — cyan signal traces and a segmented recording timeline." width="100%">
+
+# HLS Stream Recorder
+
+Record HLS streams with quality selection, timed segments, and optional caption monitoring.
+
+[![Bash 4 or newer](https://img.shields.io/badge/Bash-4%2B-29d8e8?style=flat&labelColor=202020)](#requirements) [![FFmpeg](https://img.shields.io/badge/capture-FFmpeg-29d8e8?style=flat&labelColor=202020)](#requirements) [![Experimental keyword monitor](https://img.shields.io/badge/keyword_monitor-experimental-aaaaaa?style=flat&labelColor=202020)](#keyword-monitor-mode-experimental)
+
+[Start here](#start-here) · [Modes](#mode-1-scheduled-default) · [CLI flags](#cli-flags) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Changelog](./CHANGELOG.md)
+
+</div>
 
 A bash script that records HLS live streams at the highest available bitrate. Automatically parses the master playlist, selects the best variant, runs a quality test, and records in timed segments with optional closed-caption extraction.
 
-![Shell](https://img.shields.io/badge/Shell-Bash-green) ![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-blue) ![License](https://img.shields.io/badge/License-MIT-yellow)
+## Start here
 
----
+```bash
+git clone https://github.com/essremodel/hls-stream-recorder.git
+cd hls-stream-recorder
+```
+
+Install the [requirements](#requirements), then run `./record.sh` to choose a stream and recording mode. On macOS, install Homebrew Bash and ensure `bash --version` reports 4 or newer; the system `/bin/bash` is too old for the script's associative arrays.
+
+| You want to… | Start with… |
+| --- | --- |
+| Choose a channel and record | [Usage](#usage) and [Stream Selection](#stream-selection) |
+| Record for a set duration | [Mode 2](#mode-2-record-now--duration) |
+| Schedule a time range | [Mode 3](#mode-3-record-now--time-range) |
+| Keep segments around caption keywords | [Keyword Monitor Mode](#keyword-monitor-mode-experimental), marked experimental |
+| Diagnose missing captions | [Debugging CC Issues](#debugging-cc-issues) |
+| Look up a flag | [CLI Flags](#cli-flags) |
+
+![Actual record.sh help output showing recording options, stream selection, and keyword-monitor controls.](./assets/terminal-help.png)
+
+*Verbatim options from `bash record.sh --help`, typeset for readability. This command did not probe streams or start a recording. The [full captured output](./assets/help-output.txt) includes the arguments and examples; see [capture details](./assets/README.md).*
 
 ## Features
 
@@ -31,8 +61,8 @@ A bash script that records HLS live streams at the highest available bitrate. Au
 |------|---------|
 | `ffmpeg` | `brew install ffmpeg` (macOS) / `apt install ffmpeg` (Linux) |
 | `ffprobe` | Included with ffmpeg |
-| `curl` | Pre-installed on macOS/most Linux |
-| `python3` | Pre-installed on macOS/most Linux |
+| `curl` | Install if missing; check with `curl --version` |
+| `python3` | Install Python 3 if missing; check with `python3 --version` |
 | `bash 4+` | `brew install bash` on macOS if `/bin/bash` is too old |
 
 ## Usage
@@ -113,7 +143,7 @@ Built-in channels are sourced from publicly available free streams. Many origina
 
 On an interactive run, you'll see a stream picker first and then the recording-mode menu:
 
-```
+```text
   Select a stream:
 
    1)  CBS 4 Denver (Colorado News)         ★ default
@@ -142,7 +172,7 @@ Then:
 
 Just press `1` and walk away. The script waits for the first window, records, waits for the second, records, then shows a summary.
 
-```
+```text
 1
 ```
 
@@ -150,7 +180,7 @@ Just press `1` and walk away. The script waits for the first window, records, wa
 
 Start recording immediately for a set number of minutes.
 
-```
+```text
 2
 How many minutes to record? 30
 ```
@@ -159,7 +189,7 @@ How many minutes to record? 30
 
 Specify exact start and end times. Accepts multiple formats:
 
-```
+```text
 3
 Start time: 2:30pm
 End time: 4:00pm
@@ -273,7 +303,7 @@ HLS_RECORDER_USER_AGENT="Mozilla/5.0 Custom Client" ./record.sh --stream cbs4
 
 Files are saved to a date-stamped folder next to the script:
 
-```
+```text
 recording_20260313/
 ├── segment_001.mp4
 ├── segment_001.srt    (if captions available)
@@ -288,7 +318,7 @@ On macOS, the output folder opens automatically in Finder when recording complet
 
 After all windows finish, you get a full report:
 
-```
+```text
 ╔═══════════════════════════════════════════════════════════╗
 ║  Recording Complete — 23:00:04                            ║
 ╚═══════════════════════════════════════════════════════════╝
@@ -376,7 +406,8 @@ If a segment needs intervention, you may also see lines like:
 - Keep changes incremental and avoid rewriting the capture flow unless a bug requires it.
 - Run `bash -n record.sh` before opening a pull request.
 - Update `README.md` and `CHANGELOG.md` when behavior or CLI flags change.
+- See [CONTRIBUTING.md](./CONTRIBUTING.md) for documentation checks and the limits of the current validation setup.
 
 ## License
 
-MIT
+The existing README identifies this project as **MIT**, but this repository does not include a license file. That statement is retained here for context; a complete license grant has not been added or inferred by this documentation update.
