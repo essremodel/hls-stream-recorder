@@ -373,9 +373,50 @@ If a segment needs intervention, you may also see lines like:
 - **Monitor mode** — for long runs, point `--output` at a disk with plenty of free space and keep `monitor.log` under review for CC warnings.
 - **Disk space** — a 1080p HLS stream typically runs 3–6 GB/hour depending on bitrate. Plan accordingly for multi-hour recordings.
 
-## Troubleshooting
+## Station Notes
 
-### Stream playlist fails to load
+### Which Denver station carries the show you want?
+
+**Check the network before you check the stream.** `kdvr.com` is the shared web property for a Nexstar duopoly — **KDVR (FOX 31)** and **KWGN (CW2, Channel 2)** — so a show's page living on `kdvr.com` says nothing about which signal it airs on. Getting this wrong produces a capture that verifies perfectly and contains the wrong network.
+
+| Show | Airs on | Capturable with this tool? |
+|------|---------|----------------------------|
+| FOX31 Morning News, FOX31 News at 9/10 | KDVR (FOX 31) | Yes — `fox31` entry |
+| **Great Day Colorado** (weekdays 9–10 a.m.) | **KWGN / CW2** | **No** — see below |
+
+Verify before recording: open the show's page and read its title (the Great Day Colorado page is titled *"Weekdays at 9 a.m. on KWGN Channel 2"*), and cross-check `kdvr.com/live/fox31/` against `kdvr.com/live/kwgn/` — each lists its own on-air schedule for the hour.
+
+### KWGN / CW2 (Channel 2) — no entry, and why
+
+There is deliberately **no `kwgn` entry** in `channels.conf`:
+
+- iptv-org lists KWGN channel IDs but **zero streams** for them.
+- `kdvr.com/live/kwgn/` plays through Lura/Anvato (`dcs-live.mp.lura.live`) with a short-lived, session-bound `encp`/`anvauth` token. The token works in the browser and returns **403 Forbidden** to `ffmpeg` even with a fresh token and matching `Referer`/`Origin`. The page also states the full stream requires a free account — an access control, not a UA problem. **Do not attempt to work around it.**
+- The neighboring `stream.cammonitorplus.net` IDs are not geographically ordered (1766/1770–1776 are Detroit stations), so there is no CW2 to be found next to `1768`.
+
+To capture a CW2 broadcast, use a lawful source: an antenna/cable capture, an authenticated CW2+ session on hardware you control, or request the file from the station.
+
+### No DVR — there is no rewinding either feed
+
+Both accessible sources are live-edge only. Measured 2026-07-29:
+
+- `cammonitorplus` sliding window: **~20 seconds** (the oldest segment in the playlist 404s mid-fetch). Reconstructing older timestamped segment paths (`.../2026/07/29/15/40/13-05005.ts`) returns 404 — the server deletes them.
+- CW2+ browser player `video.seekable`: **~120 seconds**.
+
+If a specific airing matters, **the recorder must already be running on the right channel before it starts.** There is no catching up afterward.
+
+### FOX 31 Denver / KDVR (`fox31`)
+
+The `fox31` entry uses a **third-party rebroadcast** from the public [iptv-org](https://github.com/iptv-org/iptv) directory (`stream.cammonitorplus.net`), not KDVR's own CDN — KDVR does not publish a direct public HLS URL, and `kdvr.com` serves a bot wall (HTTP 403) to non-browser clients. Lessons from the 2026-07-29 Great Day Colorado aircheck capture:
+
+- **A real browser User-Agent is required.** The entry carries it via a quoted `ua=` note; ffmpeg's default UA can stall on the master playlist. If capturing manually, pass the same string with `-user_agent`.
+- **Give ffmpeg the master playlist** (`/1768/index.m3u8`) so variant parsing works; the recorder resolves the variant (`tracks-v1a1/mono.m3u8`) from it. Handing the variant URL directly to `record.sh` fails its variant scan.
+- **Do not use `-reconnect_at_eof 1`** on this stream in manual captures — observed to make ffmpeg loop on EOF and write zero bytes while the process stays alive. `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5` is sufficient.
+- **Record to MPEG-TS during acquisition** for anything that matters. TS has no finalization step, so a killed process still leaves a playable file; remux to MP4 afterwards if needed.
+- **Preflight before a critical window:** first confirm the *show* actually airs on this station (see above) — a station-bug check only proves which network you are on, not that it carries your program. Then fetch the master with `curl -A "<browser UA>"` and confirm `#EXT-X-PROGRAM-DATE-TIME` tracks the current wall-clock; capture ~10 s, decode a frame, and confirm both the FOX 31/KDVR bug **and that the on-screen programming matches the expected show**. Verify the output file grows between two checks ~30 s after starting.
+- **Caveats:** the feed is 1024x576 (not full HD), unauthenticated, and can drop or disappear without notice — fine for airchecks and proof-of-airing, not a broadcast master. For broadcast-quality copies, request the file from the station.
+
+
 
 - Verify that the URL points to the HLS master playlist, not a web page.
 - Some providers rotate or expire playlist URLs. Refresh the source URL and try again.
